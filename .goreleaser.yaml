@@ -1,0 +1,48 @@
+# goreleaser configuration for rask releases.
+#
+# Platforms are darwin and linux only: the process-group kill path that
+# guarantees no orphaned test processes is unix-specific, and shipping an
+# untested windows binary would promise behavior we have not verified.
+version: 2
+
+project_name: rask
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - main: .
+    binary: rask
+    env:
+      # The tool is pure Go; disabling cgo keeps binaries static and
+      # cross-compilation trivial.
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  github:
+    owner: chronark
+    name: rask

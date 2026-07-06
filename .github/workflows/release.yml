@@ -1,0 +1,33 @@
+# Releases run in CI so no local credentials or machine state are involved:
+# push a tag matching v* and goreleaser builds, archives, and publishes the
+# GitHub release with the workflow's own token.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # goreleaser derives the changelog from git history and needs the
+          # full history plus tags, not a shallow clone.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
