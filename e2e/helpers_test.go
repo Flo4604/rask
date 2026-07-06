@@ -319,17 +319,27 @@ func fakeS3Handler(accessKey string) http.Handler {
 	})
 }
 
+// dockerRunMinio reads stdout only: `docker run -d` writes exactly the
+// container ID there, while image-pull progress goes to stderr. Mixing the
+// streams turned first-pull CI runs into a garbage "container ID" and broke
+// every docker command that received it.
 func dockerRunMinio(t *testing.T) string {
 	t.Helper()
 	image := "minio/minio:RELEASE.2024-01-16T16-07-38Z"
 	command := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1:0:9000",
 		"-e", "MINIO_ROOT_USER=rask-access", "-e", "MINIO_ROOT_PASSWORD=rask-secret",
 		image, "server", "/data")
-	output, err := command.CombinedOutput()
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	output, err := command.Output()
 	if err != nil {
-		t.Fatalf("docker run minio: %v\n%s", err, output)
+		t.Fatalf("docker run minio: %v\n%s", err, stderr.String())
 	}
-	return strings.TrimSpace(string(output))
+	id := strings.TrimSpace(string(output))
+	if id == "" || strings.ContainsAny(id, " \n") {
+		t.Fatalf("unexpected docker run output %q\nstderr:\n%s", output, stderr.String())
+	}
+	return id
 }
 
 func dockerPort(t *testing.T, id string) string {
