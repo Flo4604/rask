@@ -257,6 +257,13 @@ func (c *testCommand) run() (int, error) {
 	// Service error slots are owned by their goroutines until the WaitGroup
 	// completes; read them only after this point.
 	c.wg.Wait()
+	// Interruption is a fact of the root context, not of which select branch
+	// observed it first: with a pre-cancelled context a service can return
+	// context.Canceled before collectSuites ever sees Done, and that error
+	// must still read as clean shutdown, not a failure.
+	if c.ctx.Err() != nil {
+		c.interrupted = true
+	}
 	if c.errors[serviceCache] != nil {
 		c.summary.CacheErrors++
 	}
