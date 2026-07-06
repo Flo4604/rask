@@ -1,4 +1,4 @@
-package cmd
+package testcmd
 
 import (
 	"context"
@@ -6,17 +6,19 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/chronark/rask/internal/assert"
 	"github.com/chronark/rask/internal/cache"
+	"github.com/chronark/rask/internal/cli"
+	appconfig "github.com/chronark/rask/internal/config"
 	"github.com/chronark/rask/internal/discover"
 	"github.com/chronark/rask/internal/fingerprint"
 	"github.com/chronark/rask/internal/frontend"
 	"github.com/chronark/rask/internal/gotool"
 	"github.com/chronark/rask/internal/run"
+	"github.com/chronark/rask/internal/setup"
 )
 
 const (
@@ -33,7 +35,7 @@ const (
 	resultChannelCapacity = 0
 
 	// eventChannelCapacity bounds orchestration-to-frontend buffering.
-	eventChannelCapacity = 256
+	eventChannelCapacity = setup.EventChannelCapacity
 )
 
 const (
@@ -110,20 +112,53 @@ type suiteCache interface {
 	Put(digest string, entry cache.Entry) error
 	Delete(digest string)
 	Run(ctx context.Context) error
+	HasRemoteTier() bool
+	RemoteStats() cache.RemoteStats
 }
 
-// commandTest parses package patterns and starts the service graph.
-func commandTest(
+// Action parses package patterns and starts the service graph.
+func Action(ctx context.Context, command *cli.Command) error {
+	environment := setup.FromContext(ctx)
+	parsed := testArgumentsFromCommand(command)
+	cfg, err := appconfig.Load(environment.Stderr)
+	if err != nil {
+		environment.ExitCode = 1
+		return err
+	}
+	code, err := runTest(ctx, environment.Tool, cfg, parsed, environment.Frontend, environment.Events)
+	environment.ExitCode = code
+	return err
+}
+
+// Command returns the test command definition.
+func Command() *cli.Command {
+	return &cli.Command{
+		Name:        "test",
+		Usage:       "Run Go tests with cached suite results",
+		AcceptsArgs: true,
+		Aliases:     []string{"t"},
+		Flags:       Flags(),
+		Action:      Action,
+	}
+}
+
+// Flags returns the root test flags.
+func Flags() []cli.Flag {
+	return []cli.Flag{
+		cli.Bool("v", "render passing and ignored test lines"),
+		cli.Bool("verbose", "render passing and ignored test lines"),
+		cli.Bool("no-cache", "bypass cache reads and refresh passing suites"),
+	}
+}
+
+func runTest(
 	ctx context.Context,
 	tool gotool.Tool,
-	arguments []string,
+	cfg appconfig.Config,
+	parsed testArguments,
 	ui *frontend.Frontend,
 	events chan<- frontend.Event,
 ) (int, error) {
-	parsed, err := parseTestArguments(arguments)
-	if err != nil {
-		return 1, err
-	}
 	userDir, err := os.Getwd()
 	if err != nil {
 		return 1, fmt.Errorf("resolving working directory: %w", err)
@@ -136,12 +171,28 @@ func commandTest(
 	if err != nil {
 		return 1, err
 	}
-	resultCache, err := cache.OpenResultCache(module.Path)
+	resultCache, err := cache.Open(cache.Config{
+		ModulePath: module.Path,
+		DiskDir:    cfg.CacheDir,
+		Remote:     cfg.Remote,
+	})
 	if err != nil {
 		return 1, err
 	}
 	command := newTestCommand(ctx, tool, module, userDir, resultCache, parsed, ui, events)
 	return command.run()
+}
+
+func testArgumentsFromCommand(command *cli.Command) testArguments {
+	parsed := testArguments{
+		patterns: append([]string(nil), command.Args()...),
+		verbose:  command.Bool("v") || command.Bool("verbose"),
+		noCache:  command.Bool("no-cache"),
+	}
+	if len(parsed.patterns) == 0 {
+		parsed.patterns = []string{"./..."}
+	}
+	return parsed
 }
 
 // environmentTool reuses one full go-env read for discovery and fingerprint salting.
@@ -208,6 +259,11 @@ func (c *testCommand) run() (int, error) {
 	c.wg.Wait()
 	if c.errors[serviceCache] != nil {
 		c.summary.CacheErrors++
+	}
+	if err := serviceFailure(c.errors, c.failFast || c.interrupted); err != nil {
+		close(c.events)
+		<-c.frontendDone
+		return 1, err
 	}
 	c.finishSummary()
 	close(c.events)
@@ -320,13 +376,6 @@ func (c *testCommand) handleRunnerReceive(ok bool, event run.Event) bool {
 	}
 	c.handleRunnerEvent(event)
 	return true
-}
-
-// handleSuite partitions one suite through cache and runner policy.
-func (c *testCommand) handleSuite(suite fingerprint.Suite) {
-	c.summary.Suites++
-	c.sendFrontend(frontend.Event{Kind: frontend.EventSuiteCounted})
-	c.processSuite(suite)
 }
 
 // processSuite partitions one suite through cache and runner policy.
@@ -449,6 +498,11 @@ func (c *testCommand) finishSummary() {
 	c.summary.Tests = c.summary.Passed + c.summary.Failed + c.summary.Ignored
 	c.summary.Elapsed = time.Since(c.startedAt)
 	c.summary.Interrupted = c.interrupted
+	c.summary.RemoteConfigured = c.resultCache.HasRemoteTier()
+	stats := c.resultCache.RemoteStats()
+	c.summary.RemoteCached = stats.Reads
+	c.summary.RemoteReads = stats.Reads
+	c.summary.RemoteWrites = stats.Writes
 	sort.Strings(c.summary.FailedSuites)
 	c.sendFrontend(frontend.Event{Kind: frontend.EventSummary, Summary: c.summary})
 }
@@ -546,36 +600,4 @@ func frontendTests(tests []run.TestResult) []frontend.TestResult {
 		})
 	}
 	return out
-}
-
-// parseTestArguments returns verbosity and package patterns for one test run.
-func parseTestArguments(arguments []string) (testArguments, error) {
-	parsed := testArguments{}
-	patterns := make([]string, 0, len(arguments))
-	for _, argument := range arguments {
-		if argument == "-v" || argument == "--verbose" {
-			parsed.verbose = true
-			continue
-		}
-		if argument == "--no-cache" {
-			parsed.noCache = true
-			continue
-		}
-		if strings.HasPrefix(argument, "-") {
-			return testArguments{}, unknownTestFlag(argument)
-		}
-		patterns = append(patterns, argument)
-	}
-	if len(patterns) == 0 {
-		patterns = []string{"./..."}
-	}
-	parsed.patterns = patterns
-	return parsed, nil
-}
-
-// unknownTestFlag returns the test-command error for unsupported flags.
-func unknownTestFlag(argument string) error {
-	return fmt.Errorf(
-		"unknown flag %q (rask supports only -v/--verbose and --no-cache; use `go test` for other flags)",
-		argument)
 }

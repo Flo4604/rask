@@ -30,7 +30,7 @@ func TestFrontendProgressRegionTicks(t *testing.T) {
 		_, err := frontend.Run(context.Background())
 		done <- err
 	}()
-	sendEvent(t, events, Event{Kind: EventSuiteCounted})
+	sendEvent(t, events, Event{Kind: EventRunPlan, RunPlan: RunPlan{Suites: 1}})
 	sendEvent(t, events, Event{Kind: EventStarted, ImportPath: "example.com/m/pkg"})
 	sendTick(t, ticks, now)
 	writes := waitForWrites(t, out, 1, time.Second)
@@ -65,8 +65,7 @@ func TestFrontendProgressRegionDebouncesEventBursts(t *testing.T) {
 	frontend.startedAt = now.Add(-1500 * time.Millisecond)
 	frontend.ticks = ticks
 	done := runFrontendForTest(frontend)
-	sendEvent(t, events, Event{Kind: EventSuiteCounted})
-	sendEvent(t, events, Event{Kind: EventSuiteCounted})
+	sendEvent(t, events, Event{Kind: EventRunPlan, RunPlan: RunPlan{Suites: 2}})
 	sendEvent(t, events, Event{Kind: EventStarted, ImportPath: "example.com/m/run"})
 	sendEvent(t, events, Event{Kind: EventTestProgress, TestProgress: TestProgress{
 		ImportPath: "example.com/m/run", Completed: 1, Total: 3, TotalKnown: true,
@@ -74,9 +73,7 @@ func TestFrontendProgressRegionDebouncesEventBursts(t *testing.T) {
 	sendEvent(t, events, Event{Kind: EventTestProgress, TestProgress: TestProgress{
 		ImportPath: "example.com/m/run", Completed: 2, Total: 3, TotalKnown: true,
 	}})
-	sendEvent(t, events, Event{Kind: EventCached, Cached: CachedEvent{
-		ImportPath: "example.com/m/cached", Passed: 1,
-	}})
+	sendEvent(t, events, Event{Kind: EventCached, Cached: CachedEvent{ImportPath: "example.com/m/cached", Passed: 1}})
 	if writes := out.Writes(); len(writes) != 0 {
 		t.Fatalf("writes before tick = %d, want 0:\n%q", len(writes), writes)
 	}
@@ -116,8 +113,7 @@ func TestFrontendProgressRegionShrinkFrameClearsLeftovers(t *testing.T) {
 	frontend.startedAt = now
 	frontend.ticks = ticks
 	done := runFrontendForTest(frontend)
-	sendEvent(t, events, Event{Kind: EventSuiteCounted})
-	sendEvent(t, events, Event{Kind: EventSuiteCounted})
+	sendEvent(t, events, Event{Kind: EventRunPlan, RunPlan: RunPlan{Suites: 2}})
 	sendEvent(t, events, Event{Kind: EventStarted, ImportPath: "example.com/m/a"})
 	sendEvent(t, events, Event{Kind: EventStarted, ImportPath: "example.com/m/b"})
 	sendTick(t, ticks, now)
@@ -139,6 +135,47 @@ func TestFrontendProgressRegionShrinkFrameClearsLeftovers(t *testing.T) {
 	}
 }
 
+// TestFrontendPermanentRowsDoNotWrapAtNarrowTerminal protects cursor-up math.
+func TestFrontendPermanentRowsDoNotWrapAtNarrowTerminal(t *testing.T) {
+	out := new(recordingWriter)
+	ticks := make(chan time.Time)
+	events := make(chan Event)
+	frontend := New(out, new(bytes.Buffer), true, events)
+	frontend.ConfigureRun(false, "example.com/m")
+	frontend.color = false
+	frontend.width = 60
+	now := time.Unix(350, 0)
+	frontend.now = func() time.Time { return now }
+	frontend.startedAt = now.Add(-17 * time.Second)
+	frontend.ticks = ticks
+	done := runFrontendForTest(frontend)
+	longPath := "example.com/m/internal/" + strings.Repeat("nested/", 8) + "leaf"
+	sendEvent(t, events, Event{Kind: EventRunPlan, RunPlan: RunPlan{
+		Suites:             2,
+		MaxImportPathWidth: runeLen(ShortenImportPath(longPath, "example.com/m")),
+	}})
+	sendEvent(t, events, Event{Kind: EventStarted, ImportPath: longPath})
+	sendTick(t, ticks, now)
+	writes := waitForWrites(t, out, 1, time.Second)
+	assertFrameVisualLinesWithinWidth(t, writes[0], frontend.width)
+	sendEvent(t, events, Event{Kind: EventSuiteResult, SuiteResult: suiteWithCounts(longPath, 16369, 0, 2330)})
+	sendTick(t, ticks, now)
+	writes = waitForWrites(t, out, 2, time.Second)
+	assertFrameVisualLinesWithinWidth(t, writes[1], frontend.width)
+	if !strings.Contains(writes[1], "\r\x1b[1A"+eraseToEndOfScreen) {
+		t.Fatalf("second frame did not erase from counted header row: %q", writes[1])
+	}
+	visible := visibleFrameText(writes[1])
+	if strings.Count(visible, "Testing ") != 1 || strings.Contains(visible, "Testing 0/2") {
+		t.Fatalf("stale progress header survived in second frame: %q", visible)
+	}
+	sendEvent(t, events, Event{Kind: EventSummary, Summary: Summary{Suites: 2, Elapsed: time.Second}})
+	close(events)
+	if err := <-done; err != nil {
+		t.Fatalf("frontend run: %v", err)
+	}
+}
+
 // TestFrontendProgressRegionDrawsRunningRowsLongestFirst protects row ordering.
 func TestFrontendProgressRegionDrawsRunningRowsLongestFirst(t *testing.T) {
 	out := new(bytes.Buffer)
@@ -149,10 +186,7 @@ func TestFrontendProgressRegionDrawsRunningRowsLongestFirst(t *testing.T) {
 	now := time.Unix(100, 0)
 	frontend.now = func() time.Time { return now }
 	frontend.startedAt = now.Add(-8300 * time.Millisecond)
-	frontend.total = 74
-	frontend.done = 12
-	frontend.passed = 40
-	frontend.ignored = 1
+	frontend.total, frontend.done, frontend.passed, frontend.ignored = 74, 12, 40, 1
 	frontend.running = []runningSuite{
 		{importPath: "example.com/m/pkg/cache", startedAt: now.Add(-4100 * time.Millisecond),
 			completed: 3, total: 9, totalKnown: true},
@@ -161,10 +195,10 @@ func TestFrontendProgressRegionDrawsRunningRowsLongestFirst(t *testing.T) {
 		{importPath: "example.com/m/pkg/uid", startedAt: now.Add(-800 * time.Millisecond),
 			completed: 0, totalKnown: false},
 	}
-	frontend.draw()
-	lines := strings.Split(out.String(), "\n")
+	got := progressRegionOutput(frontend)
+	lines := strings.Split(got, "\n")
 	if len(lines) != 4 {
-		t.Fatalf("progress lines = %d, want 4:\n%q", len(lines), out.String())
+		t.Fatalf("progress lines = %d, want 4:\n%q", len(lines), got)
 	}
 	want := "Testing 12/74 suites | 41 tests: 40 passed; 0 failed; 1 ignored | 8.3s"
 	if lines[0] != want {
@@ -186,8 +220,8 @@ func TestFrontendProgressRegionDrawsRunningRowsLongestFirst(t *testing.T) {
 		strings.LastIndex(lines[1], "14.2s") != strings.LastIndex(lines[2], "4.1s") {
 		t.Fatalf("columns not aligned:\n%q\n%q", lines[1], lines[2])
 	}
-	if strings.HasSuffix(out.String(), "\n") {
-		t.Fatalf("progress region has trailing newline: %q", out.String())
+	if strings.HasSuffix(got, "\n") {
+		t.Fatalf("progress region has trailing newline: %q", got)
 	}
 }
 
@@ -208,24 +242,23 @@ func TestFrontendProgressRegionCapsOverflow(t *testing.T) {
 			startedAt:  now.Add(-time.Duration(i) * time.Second),
 		})
 	}
-	frontend.draw()
-	lines := strings.Split(out.String(), "\n")
+	got := progressRegionOutput(frontend)
+	lines := strings.Split(got, "\n")
 	if len(lines) != runningSuiteRowsMax+1 {
-		t.Fatalf("progress lines at cap = %d, want cap + header:\n%q", len(lines), out.String())
+		t.Fatalf("progress lines at cap = %d, want cap + header:\n%q", len(lines), got)
 	}
-	if strings.Contains(out.String(), "... and") {
-		t.Fatalf("progress at cap should not overflow:\n%q", out.String())
+	if strings.Contains(got, "... and") {
+		t.Fatalf("progress at cap should not overflow:\n%q", got)
 	}
-	out.Reset()
 	frontend.linesDrawn = 0
 	frontend.running = append(frontend.running, runningSuite{
 		importPath: "example.com/m/pkg/overflow",
 		startedAt:  now.Add(-time.Minute),
 	})
-	frontend.draw()
-	lines = strings.Split(out.String(), "\n")
+	got = progressRegionOutput(frontend)
+	lines = strings.Split(got, "\n")
 	if len(lines) != runningSuiteRowsMax+1 {
-		t.Fatalf("progress lines past cap = %d, want cap + header:\n%q", len(lines), out.String())
+		t.Fatalf("progress lines past cap = %d, want cap + header:\n%q", len(lines), got)
 	}
 	if lines[len(lines)-1] != "    ... and 2 more" {
 		t.Fatalf("overflow row = %q, want and-more row", lines[len(lines)-1])
@@ -248,7 +281,7 @@ func TestFrontendProgressRegionEraseMovesToTop(t *testing.T) {
 		{importPath: "example.com/m/b", startedAt: now},
 		{importPath: "example.com/m/c", startedAt: now},
 	}
-	frontend.draw()
+	frontend.linesDrawn = len(frontend.terminalProgressRows(false))
 	out.Reset()
 	frontend.erase()
 	want := "\r\x1b[3A\x1b[0J"
@@ -272,15 +305,15 @@ func TestFrontendProgressRegionRemovesFinishedSuites(t *testing.T) {
 		{importPath: "example.com/m/pkg/one", startedAt: now.Add(-2 * time.Second)},
 		{importPath: "example.com/m/pkg/two", startedAt: now.Add(-time.Second)},
 	}
-	frontend.draw()
+	progressRegionOutput(frontend)
 	frontend.suiteFinished(SuiteResult{ImportPath: "example.com/m/pkg/one"})
 	out.Reset()
-	frontend.draw()
-	if strings.Contains(out.String(), "pkg/one") {
-		t.Fatalf("finished suite still visible:\n%q", out.String())
+	got := progressRegionOutput(frontend)
+	if strings.Contains(got, "pkg/one") {
+		t.Fatalf("finished suite still visible:\n%q", got)
 	}
-	if !strings.Contains(out.String(), "pkg/two") {
-		t.Fatalf("running suite missing:\n%q", out.String())
+	if !strings.Contains(got, "pkg/two") {
+		t.Fatalf("running suite missing:\n%q", got)
 	}
 }
 
@@ -298,14 +331,14 @@ func TestFrontendProgressRegionTruncatesRunes(t *testing.T) {
 	frontend.running = []runningSuite{
 		{importPath: "example.com/m/påkage", startedAt: now},
 	}
-	frontend.draw()
-	if !strings.Contains(out.String(), "…") {
-		t.Fatalf("progress output = %q, want ellipsis", out.String())
+	got := progressRegionOutput(frontend)
+	if !strings.Contains(got, "…") {
+		t.Fatalf("progress output = %q, want ellipsis", got)
 	}
-	if !utf8.ValidString(out.String()) {
-		t.Fatalf("progress output split a rune: %q", out.String())
+	if !utf8.ValidString(got) {
+		t.Fatalf("progress output split a rune: %q", got)
 	}
-	for _, line := range strings.Split(out.String(), "\n") {
+	for _, line := range strings.Split(got, "\n") {
 		if runeLen(line) > frontend.noWrapWidth() {
 			t.Fatalf("line wrapped width %d > %d: %q", runeLen(line), frontend.noWrapWidth(), line)
 		}
@@ -330,8 +363,8 @@ func TestFrontendProgressRegionKeepsCountersOnNarrowRows(t *testing.T) {
 			completed:  7, total: 11, totalKnown: true,
 		},
 	}
-	frontend.draw()
-	lines := strings.Split(out.String(), "\n")
+	got := progressRegionOutput(frontend)
+	lines := strings.Split(got, "\n")
 	if !strings.Contains(lines[1], "(7/11)") || !strings.HasSuffix(lines[1], "12.3s") {
 		t.Fatalf("row lost progress or elapsed: %q", lines[1])
 	}
@@ -395,6 +428,27 @@ func TestFrontendSuiteBlockQuietFailureMatchesCargoShape(t *testing.T) {
 	}
 }
 
+// TestFrontendFailurePrintsShuffleSeed protects replay instructions in failures.
+func TestFrontendFailurePrintsShuffleSeed(t *testing.T) {
+	result := suiteResultFixture()
+	result.PackageOutput = []string{"-test.shuffle 12345\n", "FAIL\n"}
+	out := renderEvents(t, false, Event{Kind: EventSuiteResult, SuiteResult: result})
+	want := suiteLine("Failed", "pkg", "1 failed; 1 passed; 1 ignored", "250ms") + "\n" +
+		"test TestBad ... FAILED\n" +
+		"-test.shuffle 12345\n" +
+		"\nfailures:\n" +
+		"\n" +
+		"---- TestBad stdout ----\n" +
+		"boom\n" +
+		"\n" +
+		"failures:\n" +
+		"    TestBad\n" +
+		"\n"
+	if out != want {
+		t.Fatalf("shuffle failure output mismatch\nwant:\n%q\ngot:\n%q", want, out)
+	}
+}
+
 // TestFrontendSuiteBlockVerboseFailureMatchesCargoShape protects verbose failure rendering.
 func TestFrontendSuiteBlockVerboseFailureMatchesCargoShape(t *testing.T) {
 	out := renderEvents(t, true, Event{Kind: EventSuiteResult, SuiteResult: suiteResultFixture()})
@@ -451,6 +505,39 @@ func TestFrontendCachedLineMatchesContract(t *testing.T) {
 		"Finished 1 suite, 2 tests: 2 passed; 0 failed; 0 ignored in 50ms, 1 cached\n"
 	if out != want {
 		t.Fatalf("cached output mismatch\nwant:\n%q\ngot:\n%q", want, out)
+	}
+}
+
+// TestFrontendRemoteSummaryMatchesContract protects remote summary rendering.
+func TestFrontendRemoteSummaryMatchesContract(t *testing.T) {
+	out := renderEvents(t,
+		false,
+		Event{Kind: EventSummary, Summary: Summary{
+			Suites: 12, Tests: 300, Passed: 300, Cached: 8, RemoteCached: 3,
+			RemoteConfigured: true, RemoteReads: 3, RemoteWrites: 4,
+			Elapsed: 4200 * time.Millisecond,
+		}},
+	)
+	want := "Finished 12 suites, 300 tests: 300 passed; 0 failed; 0 ignored in 4.2s, " +
+		"8 cached (3 remote) | remote: 3 reads, 4 writes\n"
+	if out != want {
+		t.Fatalf("remote summary mismatch\nwant:\n%q\ngot:\n%q", want, out)
+	}
+}
+
+// TestFrontendRemoteSummaryShowsConfiguredZeroes protects explicit zero traffic.
+func TestFrontendRemoteSummaryShowsConfiguredZeroes(t *testing.T) {
+	out := renderEvents(t,
+		false,
+		Event{Kind: EventSummary, Summary: Summary{
+			Suites: 1, Tests: 1, Passed: 1, RemoteConfigured: true,
+			Elapsed: time.Second,
+		}},
+	)
+	want := "Finished 1 suite, 1 test: 1 passed; 0 failed; 0 ignored in 1s" +
+		" | remote: 0 reads, 0 writes\n"
+	if out != want {
+		t.Fatalf("remote zero summary mismatch\nwant:\n%q\ngot:\n%q", want, out)
 	}
 }
 
@@ -533,6 +620,43 @@ func TestFrontendSuiteRowsKeepDurationAlignedWithLargeCounts(t *testing.T) {
 	}
 	if !strings.HasSuffix(long, "17.1s  1 failed; 16369 passed; 2330 ignored") {
 		t.Fatalf("large counts did not trail unpadded: %q", long)
+	}
+}
+
+func TestFrontendTerminalSuiteRowBudgetPreservesCountsAndDuration(t *testing.T) {
+	frontend := New(new(bytes.Buffer), new(bytes.Buffer), true, nil)
+	frontend.ConfigureRun(false, "example.com/m")
+	frontend.color = false
+	frontend.width = 60
+	longPath := "internal/" + strings.Repeat("deep/", 10) + "suite"
+	frontend.runPlan(RunPlan{Suites: 1, MaxImportPathWidth: runeLen(longPath)})
+	counts := "16369 passed; 2330 ignored"
+	row := frontend.alignedSuiteRow("Passed", longPath, counts, "17.1s")
+	if runeLen(row) > frontend.noWrapWidth() {
+		t.Fatalf("terminal row width = %d, want <= %d: %q",
+			runeLen(row), frontend.noWrapWidth(), row)
+	}
+	if !strings.Contains(row, "…") {
+		t.Fatalf("terminal row did not truncate path: %q", row)
+	}
+	if !strings.HasSuffix(row, "17.1s  "+counts) {
+		t.Fatalf("terminal row lost duration or counts: %q", row)
+	}
+}
+
+func TestFrontendNonTerminalSuiteRowsAreNotWidthBudgeted(t *testing.T) {
+	frontend := New(new(bytes.Buffer), new(bytes.Buffer), false, nil)
+	frontend.ConfigureRun(false, "example.com/m")
+	frontend.width = 60
+	longPath := "internal/" + strings.Repeat("deep/", 20) + "suite"
+	frontend.runPlan(RunPlan{Suites: 1, MaxImportPathWidth: runeLen(longPath)})
+	counts := "16369 passed; 2330 ignored"
+	row := frontend.alignedSuiteRow("Passed", longPath, counts, "17.1s")
+	if runeLen(row) <= frontend.width {
+		t.Fatalf("non-terminal row was budgeted to terminal width %d: %q", frontend.width, row)
+	}
+	if !strings.HasSuffix(row, "17.1s  "+counts) {
+		t.Fatalf("non-terminal row lost duration or counts: %q", row)
 	}
 }
 
@@ -705,6 +829,14 @@ func renderEvents(t *testing.T, verbose bool, emitted ...Event) string {
 	return out.String()
 }
 
+// progressRegionOutput exercises the row path used by synchronized terminal frames.
+func progressRegionOutput(frontend *Frontend) string {
+	var out bytes.Buffer
+	rows := frontend.terminalProgressRows(false)
+	frontend.linesDrawn = writeProgressRows(&out, rows)
+	return out.String()
+}
+
 // sendEvent sends one frontend event without blocking the test forever.
 func sendEvent(t *testing.T, events chan<- Event, event Event) {
 	t.Helper()
@@ -783,6 +915,45 @@ func assertFrameClearBeforeContent(t *testing.T, frame string, content string) {
 	}
 }
 
+func assertFrameVisualLinesWithinWidth(t *testing.T, frame string, width int) {
+	t.Helper()
+	for _, line := range strings.Split(visibleFrameText(frame), "\n") {
+		if runeLen(line) > width {
+			t.Fatalf("visual line width %d > %d:\nline:  %q\nframe: %q", runeLen(line), width, line, frame)
+		}
+	}
+}
+
+func visibleFrameText(frame string) string {
+	var out strings.Builder
+	for index := 0; index < len(frame); {
+		if frame[index] == '\x1b' {
+			index = skipANSI(frame, index+1)
+			continue
+		}
+		if frame[index] == '\r' {
+			index++
+			continue
+		}
+		out.WriteByte(frame[index])
+		index++
+	}
+	return out.String()
+}
+
+func skipANSI(text string, index int) int {
+	if index < len(text) && text[index] == '[' {
+		index++
+		for index < len(text) && (text[index] < '@' || text[index] > '~') {
+			index++
+		}
+	}
+	if index < len(text) {
+		index++
+	}
+	return index
+}
+
 // recordingWriter records each Write call as a separate frame.
 type recordingWriter struct {
 	mu     sync.Mutex
@@ -826,6 +997,20 @@ func happySuiteFixture() SuiteResult {
 			{Name: "TestSkipped", Outcome: TestIgnored},
 		},
 	}
+}
+
+func suiteWithCounts(importPath string, passed int, failed int, ignored int) SuiteResult {
+	tests := make([]TestResult, 0, passed+failed+ignored)
+	for i := 0; i < passed; i++ {
+		tests = append(tests, TestResult{Name: fmt.Sprintf("TestPassed%d", i), Outcome: TestPassed})
+	}
+	for i := 0; i < failed; i++ {
+		tests = append(tests, TestResult{Name: fmt.Sprintf("TestFailed%d", i), Outcome: TestFailed})
+	}
+	for i := 0; i < ignored; i++ {
+		tests = append(tests, TestResult{Name: fmt.Sprintf("TestIgnored%d", i), Outcome: TestIgnored})
+	}
+	return SuiteResult{ImportPath: importPath, Tests: tests, ElapsedSeconds: 17.1, Failed: failed > 0}
 }
 
 // suiteResultFixture returns one mixed-result suite for rendering tests.

@@ -1,63 +1,28 @@
-package cmd
+package testcmd
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/chronark/rask/cmd/clean"
 	"github.com/chronark/rask/internal/cache"
+	"github.com/chronark/rask/internal/cli"
 	"github.com/chronark/rask/internal/fingerprint"
 	"github.com/chronark/rask/internal/frontend"
 	"github.com/chronark/rask/internal/gotool"
 	"github.com/chronark/rask/internal/run"
+	"github.com/chronark/rask/internal/setup"
 )
-
-// TestParseTestArguments protects the CLI contract for package patterns and verbosity.
-func TestParseTestArguments(t *testing.T) {
-	parsed, err := parseTestArguments(nil)
-	if err != nil || parsed.verbose || parsed.noCache ||
-		strings.Join(parsed.patterns, ",") != "./..." {
-		t.Fatalf("default arguments = %+v err=%v", parsed, err)
-	}
-	parsed, err = parseTestArguments([]string{"./pkg", "./internal/..."})
-	if err != nil || parsed.verbose || parsed.noCache ||
-		strings.Join(parsed.patterns, ",") != "./pkg,./internal/..." {
-		t.Fatalf("patterns = %+v err=%v", parsed, err)
-	}
-	for _, test := range []struct {
-		arguments []string
-		patterns  string
-		verbose   bool
-		noCache   bool
-	}{
-		{arguments: []string{"-v", "./pkg"}, patterns: "./pkg", verbose: true},
-		{arguments: []string{"./pkg", "--verbose", "./internal/..."}, patterns: "./pkg,./internal/...", verbose: true},
-		{arguments: []string{"--no-cache", "./pkg"}, patterns: "./pkg", noCache: true},
-		{arguments: []string{"./pkg", "--no-cache", "./internal/..."}, patterns: "./pkg,./internal/...", noCache: true},
-		{arguments: []string{"-v", "./pkg", "--no-cache"}, patterns: "./pkg", verbose: true, noCache: true},
-	} {
-		parsed, err = parseTestArguments(test.arguments)
-		if err != nil || parsed.verbose != test.verbose || parsed.noCache != test.noCache ||
-			strings.Join(parsed.patterns, ",") != test.patterns {
-			t.Fatalf("flag arguments = %+v err=%v", parsed, err)
-		}
-	}
-	for _, argument := range []string{"-run", "-count=1"} {
-		_, err = parseTestArguments([]string{argument})
-		if err == nil {
-			t.Fatalf("%s must be rejected", argument)
-		}
-		if !strings.Contains(err.Error(), "supports only -v/--verbose and --no-cache") {
-			t.Fatalf("err=%q, want supported-flag message", err.Error())
-		}
-	}
-}
 
 // TestExecuteReturnsZeroForPassingRun protects Execute success exit-code behavior.
 func TestExecuteReturnsZeroForPassingRun(t *testing.T) {
@@ -79,6 +44,21 @@ func TestExecuteReturnsZeroForPassingRun(t *testing.T) {
 	}
 	if strings.Contains(out, "test TestOK ... ok") {
 		t.Fatalf("default output contains passing test line:\n%s", out)
+	}
+}
+
+// TestExecuteRootRunsTests protects `rask [patterns]` as the default action.
+func TestExecuteRootRunsTests(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	t.Setenv("RASK_CACHE_DIR", t.TempDir())
+	passing := packageFixture(module, "passing")
+	writePackageFiles(t, passing)
+	tool := &fakeTool{module: module, all: []gotool.Package{passing}, streams: map[string]string{
+		passing.ImportPath: `{"Action":"pass","Elapsed":0.01}` + "\n",
+	}}
+	code, _, errOut := executeWithTool(t, tool, "./...")
+	if code != 0 {
+		t.Fatalf("code=%d errOut=%q, want zero", code, errOut)
 	}
 }
 
@@ -162,6 +142,7 @@ func TestExecuteFailFastCancelMidStreamCountsOnce(t *testing.T) {
 	t.Setenv("RASK_CACHE_DIR", t.TempDir())
 	first := packageFixture(module, "first")
 	second := packageFixture(module, "second")
+	second.Imports = []string{first.ImportPath}
 	writePackageFiles(t, first)
 	writePackageFiles(t, second)
 	tool := &fakeTool{module: module, all: []gotool.Package{first, second}, streams: map[string]string{
@@ -190,7 +171,11 @@ func TestOrchestratorDrainsResultsWhileDispatchingTasks(t *testing.T) {
 	defer runtime.GOMAXPROCS(old)
 	module := moduleFixtureRoot(t)
 	t.Setenv("RASK_CACHE_DIR", t.TempDir())
-	resultCache, err := cache.OpenResultCache(module.Path)
+	resultCache, err := cache.Open(cache.Config{
+		ModulePath: module.Path,
+		DiskDir:    t.TempDir(),
+		Remote:     nil,
+	})
 	if err != nil {
 		t.Fatalf("open cache: %v", err)
 	}
@@ -204,6 +189,7 @@ func TestOrchestratorDrainsResultsWhileDispatchingTasks(t *testing.T) {
 	command := &testCommand{
 		ctx: ctx, runCtx: ctx, frontendCtx: ctx, module: module, tool: tool,
 		resultCache: resultCache, tasks: tasks, results: results, events: events, resultsOpen: true,
+		summary: frontend.Summary{Suites: len(suites)},
 	}
 	runner := run.New(tool, module.Dir, tasks, results)
 	runnerDone := make(chan error, 1)
@@ -235,8 +221,9 @@ func TestNoCacheBypassesHitsAndRefreshesPasses(t *testing.T) {
 	cached := &testCommand{
 		ctx: context.Background(), runCtx: context.Background(), frontendCtx: context.Background(),
 		resultCache: resultCache, tasks: make(chan run.SuiteTask, 1), events: events,
+		summary: frontend.Summary{Suites: 1},
 	}
-	cached.handleSuite(suite)
+	cached.processSuite(suite)
 	if resultCache.gets != 1 || cached.summary.Cached != 1 || cached.summary.Passed != 1 {
 		t.Fatalf("cached path gets=%d summary=%+v, want one cached hit", resultCache.gets, cached.summary)
 	}
@@ -359,7 +346,11 @@ func waitForRunner(t *testing.T, ctx context.Context, done <-chan error) {
 // TestOnlyPassingSuitesAreCachedAndFailuresDelete protects the cache-write policy.
 func TestOnlyPassingSuitesAreCachedAndFailuresDelete(t *testing.T) {
 	t.Setenv("RASK_CACHE_DIR", t.TempDir())
-	resultCache, err := cache.OpenResultCache("example.com/m")
+	resultCache, err := cache.Open(cache.Config{
+		ModulePath: "example.com/m",
+		DiskDir:    t.TempDir(),
+		Remote:     nil,
+	})
 	if err != nil {
 		t.Fatalf("open cache: %v", err)
 	}
@@ -378,6 +369,43 @@ func TestOnlyPassingSuitesAreCachedAndFailuresDelete(t *testing.T) {
 	}, &summary)
 	if _, found := resultCache.Get(passing.Digest); found {
 		t.Fatalf("failed suite must delete stale cache entry")
+	}
+}
+
+// TestExecuteUsesRemoteTierEndToEnd protects command wiring to shared remote cache.
+func TestExecuteUsesRemoteTierEndToEnd(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	passing := packageFixture(module, "passing")
+	writePackageFiles(t, passing)
+	t.Setenv("RASK_CACHE_DIR", t.TempDir())
+	t.Setenv("RASK_CONFIG", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("RASK_REMOTE_CACHE_BUCKET", "bucket")
+	t.Setenv("RASK_REMOTE_CACHE_PREFIX", "prefix")
+	t.Setenv("RASK_REMOTE_CACHE_ACCESS_KEY_ID", "test-access")
+	t.Setenv("RASK_REMOTE_CACHE_SECRET_ACCESS_KEY", "test-secret")
+	t.Setenv("RASK_REMOTE_CACHE_REGION", "auto")
+	t.Setenv("RASK_REMOTE_CACHE_ENDPOINT", "http://rask.test")
+	oldTransport := http.DefaultTransport
+	http.DefaultTransport = cmdHandlerTransport{handler: newCommandS3Handler(t)}
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+
+	firstTool := &fakeTool{module: module, all: []gotool.Package{passing}, streams: map[string]string{
+		passing.ImportPath: `{"Action":"run","Test":"TestOK"}` + "\n" +
+			`{"Action":"pass","Test":"TestOK"}` + "\n" +
+			`{"Action":"pass","Elapsed":0.01}` + "\n",
+	}}
+	code, out, errOut := executeWithTool(t, firstTool, "test", "./...")
+	if code != 0 {
+		t.Fatalf("first code=%d errOut=%q, want success", code, errOut)
+	}
+	t.Setenv("RASK_CACHE_DIR", t.TempDir())
+	secondTool := &fakeTool{module: module, all: []gotool.Package{passing}}
+	code, out, errOut = executeWithTool(t, secondTool, "test", "./...")
+	if code != 0 || !strings.Contains(out, "Cached passing") {
+		t.Fatalf("second code=%d out=%q errOut=%q, want remote cache hit", code, out, errOut)
+	}
+	if secondTool.started[passing.ImportPath] != 0 {
+		t.Fatalf("second run started %d suites, want remote cache hit", secondTool.started[passing.ImportPath])
 	}
 }
 
@@ -436,7 +464,7 @@ func drainHasCachedEvent(events <-chan frontend.Event) bool {
 // dispatchSuites sends suites and drains remaining runner results.
 func dispatchSuites(command *testCommand, suites []fingerprint.Suite) {
 	for _, suite := range suites {
-		command.handleSuite(suite)
+		command.processSuite(suite)
 	}
 	command.closeTasks()
 	for command.resultsOpen {
@@ -448,17 +476,85 @@ func dispatchSuites(command *testCommand, suites []fingerprint.Suite) {
 // executeWithTool runs Execute with a fake command environment.
 func executeWithTool(t *testing.T, tool gotool.Tool, arguments ...string) (int, string, string) {
 	t.Helper()
-	oldEnvironment := buildCommandEnvironment
+	t.Setenv("RASK_CONFIG", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("RASK_CACHE_DIR", t.TempDir())
+	oldEnvironment := setup.BuildEnvironment
 	out := new(strings.Builder)
 	errOut := new(strings.Builder)
-	buildCommandEnvironment = func() commandEnvironment {
-		return commandEnvironment{tool: tool, stdout: out, stderr: errOut}
+	setup.BuildEnvironment = func() *setup.Environment {
+		events := make(chan frontend.Event, eventChannelCapacity)
+		return &setup.Environment{
+			Tool: tool, Stdout: out, Stderr: errOut,
+			Frontend: frontend.New(out, errOut, false, events),
+			Events:   events,
+		}
 	}
 	t.Cleanup(func() {
-		buildCommandEnvironment = oldEnvironment
+		setup.BuildEnvironment = oldEnvironment
 	})
-	code := Execute(append([]string{"rask"}, arguments...))
+	code := setup.Execute(rootCommandForTest(), append([]string{"rask"}, arguments...))
 	return code, out.String(), errOut.String()
+}
+
+func rootCommandForTest() *cli.Command {
+	testCommand := Command()
+	return &cli.Command{
+		Name:               "rask",
+		Usage:              "Run Go tests with content-addressed result caching",
+		Description:        "Testing takes package patterns plus -v/--verbose and --no-cache.",
+		Flags:              testCommand.Flags,
+		Action:             testCommand.Action,
+		AcceptsArgs:        true,
+		DefaultActionNames: []string{"test", "t"},
+		UnknownFlagHint:    "rask supports only -v/--verbose and --no-cache; use `go test` for other flags",
+		Commands: []*cli.Command{
+			clean.Command(),
+		},
+	}
+}
+
+func newCommandS3Handler(t *testing.T) http.Handler {
+	t.Helper()
+	var mu sync.Mutex
+	objects := map[string][]byte{}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+			http.Error(w, "unauthorized", http.StatusForbidden)
+			return
+		}
+		key := strings.TrimPrefix(r.URL.Path, "/")
+		switch r.Method {
+		case http.MethodGet:
+			mu.Lock()
+			body, found := objects[key]
+			mu.Unlock()
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(append([]byte(nil), body...))
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			objects[key] = append([]byte(nil), body...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+}
+
+// cmdHandlerTransport routes HTTP clients into a handler without opening a port.
+type cmdHandlerTransport struct {
+	handler http.Handler
+}
+
+// RoundTrip serves req through the configured handler and returns its response.
+func (t cmdHandlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	response := httptest.NewRecorder()
+	t.handler.ServeHTTP(response, req)
+	return response.Result(), nil
 }
 
 // frontendForTest returns a non-terminal frontend and its event channel.
@@ -625,6 +721,16 @@ func (c *memorySuiteCache) Run(ctx context.Context) error {
 	return nil
 }
 
+// HasRemoteTier reports that the memory cache is local-only.
+func (c *memorySuiteCache) HasRemoteTier() bool {
+	return false
+}
+
+// RemoteStats returns no remote traffic for the memory cache.
+func (c *memorySuiteCache) RemoteStats() cache.RemoteStats {
+	return cache.RemoteStats{}
+}
+
 // failingPruneCache simulates a final cache prune failure.
 type failingPruneCache struct {
 	memorySuiteCache
@@ -638,10 +744,12 @@ func (c *failingPruneCache) Run(ctx context.Context) error {
 
 // recordingSuiteCache tracks cache operations for orchestration tests.
 type recordingSuiteCache struct {
-	entries map[string]cache.Entry
-	gets    int
-	puts    int
-	deletes int
+	entries     map[string]cache.Entry
+	remoteStats cache.RemoteStats
+	remote      bool
+	gets        int
+	puts        int
+	deletes     int
 }
 
 // newRecordingSuiteCache returns a cache seeded with one digest entry.
@@ -673,4 +781,14 @@ func (c *recordingSuiteCache) Delete(digest string) {
 func (c *recordingSuiteCache) Run(ctx context.Context) error {
 	<-ctx.Done()
 	return nil
+}
+
+// HasRemoteTier reports whether the recording cache has a remote tier.
+func (c *recordingSuiteCache) HasRemoteTier() bool {
+	return c.remote
+}
+
+// RemoteStats returns the configured remote traffic snapshot.
+func (c *recordingSuiteCache) RemoteStats() cache.RemoteStats {
+	return c.remoteStats
 }

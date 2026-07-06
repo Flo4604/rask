@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/chronark/rask/internal/assert"
 	"github.com/chronark/rask/internal/discover"
@@ -63,6 +65,7 @@ type Fingerprinter struct {
 	module gotool.Module
 	in     <-chan gotool.Package
 	out    chan<- Suite
+	rand   *rand.Rand
 }
 
 // New returns a fingerprinter connected to package and suite channels.
@@ -72,29 +75,41 @@ func New(
 	in <-chan gotool.Package,
 	out chan<- Suite,
 ) *Fingerprinter {
-	return &Fingerprinter{tool: tool, module: module, in: in, out: out}
+	return newWithRand(tool, module, in, out, randomRand())
 }
 
-// fingerprint returns cacheable suite digests for selected packages with tests.
-//
-// The salt includes the cache format version, stable `go env` lines, go.work
-// when active, and module metadata. Packages without tests still contribute
-// build digests for dependents.
-func fingerprint(
+// newWithRand returns a fingerprinter using rand for ready-queue tie-breaks.
+func newWithRand(
+	tool gotool.Tool,
+	module gotool.Module,
+	in <-chan gotool.Package,
+	out chan<- Suite,
+	rng *rand.Rand,
+) *Fingerprinter {
+	assert.NotNil(rng, "fingerprinting needs a random source")
+	return &Fingerprinter{tool: tool, module: module, in: in, out: out, rand: rng}
+}
+
+// fingerprintWithRand returns suite digests ordered by randomized topological build order.
+func fingerprintWithRand(
 	tool gotool.Tool,
 	module gotool.Module,
 	packages []gotool.Package,
+	rng *rand.Rand,
 ) ([]Suite, error) {
+	assert.NotNil(rng, "fingerprinting needs a random source")
 	salt, err := hashSalt(tool, module)
 	if err != nil {
 		return nil, err
 	}
-	buildDigests, err := buildDigestMap(packages, salt)
+	buildDigests, buildOrder, err := buildDigestMap(packages, salt, rng)
 	if err != nil {
 		return nil, err
 	}
 	suites := make([]Suite, 0, len(packages))
-	for _, p := range packages {
+	byPath := packageMap(packages)
+	for _, importPath := range buildOrder {
+		p := byPath[importPath]
 		if !p.Selected || !p.HasTests() {
 			continue
 		}
@@ -104,9 +119,6 @@ func fingerprint(
 		}
 		suites = append(suites, Suite{Package: p, Digest: digest})
 	}
-	sort.Slice(suites, func(i, j int) bool {
-		return suites[i].Package.ImportPath < suites[j].Package.ImportPath
-	})
 	return suites, nil
 }
 
@@ -121,7 +133,7 @@ func (f *Fingerprinter) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	suites, err := fingerprint(f.tool, f.module, packages)
+	suites, err := fingerprintWithRand(f.tool, f.module, packages, f.rand)
 	if err != nil {
 		return err
 	}
@@ -155,18 +167,21 @@ func (f *Fingerprinter) collect(ctx context.Context) ([]gotool.Package, error) {
 func buildDigestMap(
 	packages []gotool.Package,
 	salt string,
-) (map[string]string, error) {
+	rng *rand.Rand,
+) (map[string]string, []string, error) {
 	byPath := packageMap(packages)
 	pending, dependents := buildGraph(packages, byPath)
 	ready := readyPackages(pending)
 	buildDigests := make(map[string]string, len(packages))
-	for index := 0; index < len(ready); index++ {
-		importPath := ready[index]
+	buildOrder := make([]string, 0, len(packages))
+	for len(ready) > 0 {
+		importPath := popReady(&ready, randomIndex(rng, len(ready)))
 		digest, err := hashBuild(byPath[importPath], buildDigests, salt)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		buildDigests[importPath] = digest
+		buildOrder = append(buildOrder, importPath)
 		for _, dependent := range dependents[importPath] {
 			pending[dependent]--
 			assert.GreaterOrEqual(pending[dependent], 0)
@@ -176,9 +191,29 @@ func buildDigestMap(
 		}
 	}
 	if len(buildDigests) != len(packages) {
-		return nil, fmt.Errorf("unresolved discovered imports prevented fingerprinting")
+		return nil, nil, fmt.Errorf("unresolved discovered imports prevented fingerprinting")
 	}
-	return buildDigests, nil
+	return buildDigests, buildOrder, nil
+}
+
+// popReady removes and returns one ready import path from the queue.
+func popReady(ready *[]string, index int) string {
+	importPath := (*ready)[index]
+	copy((*ready)[index:], (*ready)[index+1:])
+	*ready = (*ready)[:len(*ready)-1]
+	return importPath
+}
+
+// randomIndex returns a pseudo-random queue index.
+func randomIndex(rng *rand.Rand, n int) int {
+	assert.Greater(n, 0)
+	return rng.IntN(n)
+}
+
+// randomRand returns a fresh process-local pseudo-random source.
+func randomRand() *rand.Rand {
+	seed := uint64(time.Now().UnixNano())
+	return rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 }
 
 // buildGraph returns Kahn-sort state over discovered build imports.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,20 @@ func TestParseListedTestsFiltersSummaries(t *testing.T) {
 	tests := parseListedTests(output)
 	if strings.Join(tests, ",") != "TestAlpha,TestBeta" {
 		t.Fatalf("tests = %q, want listed names only", tests)
+	}
+}
+
+// TestGoTestArgumentsAlwaysShuffle protects rask's fixed suite invocation.
+func TestGoTestArgumentsAlwaysShuffle(t *testing.T) {
+	arguments := goTestArguments("example.com/m/pkg")
+	for _, want := range []string{"test", "-json", "-count=1", "-failfast", "-shuffle=on", "example.com/m/pkg"} {
+		if !slices.Contains(arguments, want) {
+			t.Fatalf("arguments = %v, missing %s", arguments, want)
+		}
+	}
+	listArguments := goListTestArguments("example.com/m/pkg")
+	if slices.Contains(listArguments, "-shuffle=on") {
+		t.Fatalf("list arguments = %v, want no -shuffle for name listing", listArguments)
 	}
 }
 

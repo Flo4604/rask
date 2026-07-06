@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +11,7 @@ import (
 
 // TestCachePolicy protects module sharding, deletion, and module-scoped clean behavior.
 func TestCachePolicy(t *testing.T) {
-	rootDir := filepath.Join(t.TempDir(), dirName)
+	rootDir := t.TempDir()
 	cacheA := openCacheAt(t, rootDir, "example.com/m")
 	cacheB := openCacheAt(t, rootDir, "example.com/m")
 	cacheOther := openCacheAt(t, rootDir, "example.com/other")
@@ -47,7 +48,7 @@ func TestCachePolicy(t *testing.T) {
 
 // TestCacheSelfHealsPrunesAndReadBackMissIsError protects corrupt-object and clean-race behavior.
 func TestCacheSelfHealsPrunesAndReadBackMissIsError(t *testing.T) {
-	resultCache := openCacheAt(t, filepath.Join(t.TempDir(), dirName), "example.com/m")
+	resultCache := openCacheAt(t, t.TempDir(), "example.com/m")
 	digest := digestForTest("b")
 	path := filepath.Join(resultCache.store.(*diskStore).rootDir, filepath.FromSlash(resultCache.objectKey(digest)))
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -133,7 +134,7 @@ func TestDiskStoreCleanRefusesGenericCacheDirTag(t *testing.T) {
 
 // TestDiskStoreCleanRefusesTagRemovedAfterOpen protects delete-time validation.
 func TestDiskStoreCleanRefusesTagRemovedAfterOpen(t *testing.T) {
-	rootDir := filepath.Join(t.TempDir(), dirName)
+	rootDir := t.TempDir()
 	resultCache := openCacheAt(t, rootDir, "example.com/m")
 	digest := digestForTest("c")
 	if err := resultCache.Put(digest, entryForTest()); err != nil {
@@ -156,7 +157,7 @@ func TestDiskStoreCleanRefusesTagRemovedAfterOpen(t *testing.T) {
 
 // TestCachePruneRemovesOnlyOldTemporaryObjects protects crash orphan cleanup.
 func TestCachePruneRemovesOnlyOldTemporaryObjects(t *testing.T) {
-	resultCache := openCacheAt(t, filepath.Join(t.TempDir(), dirName), "example.com/m")
+	resultCache := openCacheAt(t, t.TempDir(), "example.com/m")
 	oldTmp := resultCache.objectKey(digestForTest("d")) + ".tmp.123"
 	freshTmp := resultCache.objectKey(digestForTest("e")) + ".tmp.456"
 	store := resultCache.store.(*diskStore)
@@ -194,6 +195,15 @@ func entryForTest() Entry {
 		ImportPath: "example.com/m/pkg", Passed: 1, Ignored: 1,
 		ElapsedSeconds: 0.25, CreatedAt: time.Now(),
 	}
+}
+
+func entryJSONForTest(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(entryForTest())
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	return body
 }
 
 // writeFile creates a fixture file for disk-store tests.

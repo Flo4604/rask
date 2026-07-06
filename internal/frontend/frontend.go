@@ -50,6 +50,15 @@ const (
 	// suiteDurationColumnWidth right-aligns elapsed durations before counts.
 	suiteDurationColumnWidth = 8
 
+	// suiteCountsReserveWidth budgets permanent terminal rows for realistic counts.
+	//
+	// It covers "16369 passed; 2330 ignored", keeping the recoverable path as
+	// the field that bends first when terminal width is tight.
+	suiteCountsReserveWidth = 26
+
+	// suiteCountsSeparatorWidth is the two-space gap before count text.
+	suiteCountsSeparatorWidth = 2
+
 	// colorReset clears ANSI styling.
 	colorReset = "\x1b[0m"
 
@@ -143,9 +152,6 @@ const (
 	// even though the suite did not run.
 	EventCached
 
-	// EventSuiteCounted records one fingerprinted suite for status totals.
-	EventSuiteCounted
-
 	// EventStarted records a suite that entered the runner pool.
 	EventStarted
 
@@ -164,17 +170,6 @@ const (
 	// EventRemoved renders a module-cache removal status.
 	EventRemoved
 )
-
-// usageText is rendered by RenderUsage so command code never writes stdout directly.
-const usageText = `rask - a Go test runner with content-addressed result caching
-
-Usage: rask [-v|--verbose] [--no-cache] [packages]
-       rask clean [--all]
-
-rask takes only package patterns plus -v/--verbose and --no-cache. It always
-runs whole suites and always fails fast. For test filters, bench, fuzz,
-coverage, or other flags, use go test directly.
-`
 
 // CachedEvent is the render payload for a cache-hit suite.
 type CachedEvent struct {
@@ -262,6 +257,9 @@ type Summary struct {
 	// Cached is the number of suites served from cache.
 	Cached int
 
+	// RemoteCached is the number of cached suites served by the remote tier.
+	RemoteCached int
+
 	// Skipped is the number of suites skipped by fail-fast.
 	Skipped int
 
@@ -273,6 +271,15 @@ type Summary struct {
 
 	// CacheDisabledReason explains why result caching was bypassed for the run.
 	CacheDisabledReason string
+
+	// RemoteConfigured reports that the run used a configured remote tier.
+	RemoteConfigured bool
+
+	// RemoteReads is the number of successful remote cache hits.
+	RemoteReads int
+
+	// RemoteWrites is the number of successful remote cache writes.
+	RemoteWrites int
 
 	// Interrupted reports that root signal cancellation stopped queued suites.
 	Interrupted bool
@@ -316,12 +323,10 @@ type Frontend struct {
 	ignored    int
 	running    []runningSuite
 	linesDrawn int
-	// statusDirty means an event changed status data since the last ticker repaint.
-	statusDirty bool
-	exitCode    int
-	now         func() time.Time
-	ticks       <-chan time.Time
-	framing     bool
+	exitCode   int
+	now        func() time.Time
+	ticks      <-chan time.Time
+	framing    bool
 }
 
 // New returns a frontend writing to out and errOut and consuming in during Run.
@@ -345,11 +350,6 @@ func New(out io.Writer, errOut io.Writer, terminal bool, in <-chan Event) *Front
 func (f *Frontend) ConfigureRun(verbose bool, modulePath string) {
 	f.verbose = verbose
 	f.modulePath = modulePath
-}
-
-// RenderUsage renders CLI help text.
-func (f *Frontend) RenderUsage() {
-	fmt.Fprint(f.out, usageText)
 }
 
 // RenderError renders a fatal CLI error and marks the frontend as failing.
@@ -485,11 +485,10 @@ func (f *Frontend) writeTerminalFrame(previousRows int, permanent []byte, rows [
 	}
 	frame.WriteString(eraseToEndOfScreen)
 	frame.Write(permanent)
-	writeProgressRows(&frame, rows)
+	drawnRows := writeProgressRows(&frame, rows)
 	frame.WriteString(synchronizedOutputClose)
 	_, err := f.out.Write(frame.Bytes())
-	f.linesDrawn = len(rows)
-	f.statusDirty = false
+	f.linesDrawn = drawnRows
 	return err
 }
 
@@ -500,9 +499,6 @@ func (f *Frontend) applyEvent(event Event) error {
 		f.runPlan(event.RunPlan)
 	case EventCached:
 		f.cached(event.Cached)
-	case EventSuiteCounted:
-		f.total++
-		f.markStatusDirty()
 	case EventStarted:
 		f.suiteStarted(event.ImportPath)
 	case EventTestProgress:
@@ -524,8 +520,7 @@ func (f *Frontend) applyEvent(event Event) error {
 // runPlan fixes run-wide suite totals and permanent-row path width.
 func (f *Frontend) runPlan(plan RunPlan) {
 	f.total = plan.Suites
-	f.pathWidth = min(plan.MaxImportPathWidth, suitePathColumnCap)
-	f.markStatusDirty()
+	f.pathWidth = f.plannedSuitePathWidth(plan.MaxImportPathWidth)
 }
 
 // cached renders one cache-hit suite line and updates aggregate progress.
@@ -536,13 +531,11 @@ func (f *Frontend) cached(event CachedEvent) {
 	f.ignored += event.Ignored
 	f.preparePermanentOutput()
 	fmt.Fprintln(f.out, f.cachedSuiteRow(event.ImportPath))
-	f.markStatusDirty()
 }
 
 // suiteStarted records an executing suite for sticky-region elapsed rows.
 func (f *Frontend) suiteStarted(importPath string) {
 	f.running = append(f.running, runningSuite{importPath: importPath, startedAt: f.now()})
-	f.markStatusDirty()
 }
 
 // suiteProgress updates cosmetic counters for the sticky terminal region only.
@@ -558,7 +551,6 @@ func (f *Frontend) suiteProgress(progress TestProgress) {
 		f.running[index].total = progress.Total
 		f.running[index].totalKnown = progress.TotalKnown
 		f.running[index].initialized = true
-		f.markStatusDirty()
 		return
 	}
 }
@@ -573,7 +565,6 @@ func (f *Frontend) suiteFinished(result SuiteResult) {
 	f.passed += passed
 	f.failed += failed
 	f.ignored += ignored
-	f.markStatusDirty()
 }
 
 // summary stops the sticky ticker and renders the final run summary.
@@ -608,12 +599,20 @@ func (f *Frontend) summary(summary Summary) {
 	cachedNote := ""
 	if summary.Cached > 0 {
 		cachedNote = fmt.Sprintf(", %d cached", summary.Cached)
+		if summary.RemoteConfigured {
+			cachedNote += fmt.Sprintf(" (%d remote)", summary.RemoteCached)
+		}
+	}
+	remoteNote := ""
+	if summary.RemoteConfigured {
+		remoteNote = fmt.Sprintf(" | remote: %d reads, %d writes",
+			summary.RemoteReads, summary.RemoteWrites)
 	}
 	f.status(colorGreenBold, "Finished",
-		"%d %s, %d %s: %d passed; %d failed; %d ignored in %s%s",
+		"%d %s, %d %s: %d passed; %d failed; %d ignored in %s%s%s",
 		summary.Suites, plural(summary.Suites, "suite"), summary.Tests,
 		plural(summary.Tests, "test"), summary.Passed, summary.Failed,
-		summary.Ignored, formatPermanentDuration(summary.Elapsed), cachedNote)
+		summary.Ignored, formatPermanentDuration(summary.Elapsed), cachedNote, remoteNote)
 }
 
 // removed renders a module-cache removal message.
@@ -638,11 +637,14 @@ func (f *Frontend) renderSuiteResult(result SuiteResult) {
 		}
 	}
 	failures := failingTests(result.Tests)
+	if result.Failed {
+		f.renderPackageOutput(result.PackageOutput)
+	}
 	if len(failures) > 0 {
 		f.renderFailureDetails(failures)
 	}
 	if result.Failed && len(failures) == 0 {
-		f.renderPackageFailure(result)
+		f.renderPackageError(result.Err)
 	}
 }
 
@@ -670,14 +672,9 @@ func (f *Frontend) cachedSuiteRow(importPath string) string {
 
 // alignedSuiteRow builds an aligned suite row before optional verb coloring.
 func (f *Frontend) alignedSuiteRow(verb string, path string, counts string, duration string) string {
-	pathWidth := f.resultPathWidth(path)
-	path = truncateMiddle(path, pathWidth)
-	row := fmt.Sprintf("%-*s %-*s%*s", suiteVerbWidth, verb,
-		pathWidth, path, suiteDurationColumnWidth, duration)
-	if counts != "" {
-		row += "  " + counts
-	}
-	return row
+	pathWidth := f.resultPathWidth(path, counts, duration)
+	row := formatAlignedSuiteRow(verb, path, counts, duration, pathWidth)
+	return f.guardPermanentSuiteRow(row, verb, path, counts, duration, pathWidth)
 }
 
 // shortenedList renders failed package paths with the same display shortening as suite rows.
@@ -689,8 +686,19 @@ func (f *Frontend) shortenedList(importPaths []string) string {
 	return strings.Join(shortened, ", ")
 }
 
-// resultPathWidth returns the planned path width reduced only to keep fixed columns visible.
-func (f *Frontend) resultPathWidth(path string) int {
+// plannedSuitePathWidth budgets terminal permanent rows before any result prints.
+func (f *Frontend) plannedSuitePathWidth(width int) int {
+	pathWidth := min(width, suitePathColumnCap)
+	if !f.terminal {
+		return pathWidth
+	}
+	fixed := suiteVerbWidth + 1 + suiteDurationColumnWidth
+	fixed += suiteCountsSeparatorWidth + suiteCountsReserveWidth
+	return min(pathWidth, max(f.width-fixed, 1))
+}
+
+// resultPathWidth returns the planned path width reduced for actual row text.
+func (f *Frontend) resultPathWidth(path string, counts string, duration string) int {
 	pathWidth := min(f.pathWidth, suitePathColumnCap)
 	if pathWidth == 0 {
 		pathWidth = min(runeLen(path), suitePathColumnCap)
@@ -698,8 +706,47 @@ func (f *Frontend) resultPathWidth(path string) int {
 	if !f.terminal {
 		return pathWidth
 	}
-	fixed := suiteVerbWidth + 1 + suiteDurationColumnWidth + 2
-	return min(pathWidth, max(f.permanentRowWidth()-fixed, 1))
+	return min(pathWidth, max(f.permanentRowWidth()-suiteRowFixedWidth(counts, duration), 0))
+}
+
+// guardPermanentSuiteRow is the hard half of the terminal no-wrap invariant.
+//
+// Terminal cursor arithmetic assumes permanent suite rows written above the
+// live region occupy one visual row. The path is recoverable from context, so
+// it is middle-truncated further before counts or duration are allowed to bend.
+func (f *Frontend) guardPermanentSuiteRow(
+	row string, verb string, path string, counts string, duration string, pathWidth int,
+) string {
+	if !f.terminal || runeLen(row) <= f.permanentRowWidth() {
+		return row
+	}
+	for width := pathWidth - 1; width >= 0; width-- {
+		row = formatAlignedSuiteRow(verb, path, counts, duration, width)
+		if runeLen(row) <= f.permanentRowWidth() {
+			return row
+		}
+	}
+	return f.noWrapLine(formatAlignedSuiteRow(verb, path, counts, duration, 0))
+}
+
+// formatAlignedSuiteRow builds an aligned suite row before optional verb coloring.
+func formatAlignedSuiteRow(verb string, path string, counts string, duration string, pathWidth int) string {
+	path = truncateMiddle(path, pathWidth)
+	row := fmt.Sprintf("%-*s %-*s%*s", suiteVerbWidth, verb,
+		pathWidth, path, suiteDurationColumnWidth, duration)
+	if counts != "" {
+		row += strings.Repeat(" ", suiteCountsSeparatorWidth) + counts
+	}
+	return row
+}
+
+// suiteRowFixedWidth returns the permanent row width without the path column.
+func suiteRowFixedWidth(counts string, duration string) int {
+	width := suiteVerbWidth + 1 + max(suiteDurationColumnWidth, runeLen(duration))
+	if counts != "" {
+		width += suiteCountsSeparatorWidth + runeLen(counts)
+	}
+	return width
 }
 
 // renderFailureDetails renders retained output for failed tests with cargo-style spacing.
@@ -725,27 +772,26 @@ func (f *Frontend) renderFailureDetails(failures []TestResult) {
 	fmt.Fprintln(f.out)
 }
 
-// renderPackageFailure renders package-level output when no individual test failed.
-func (f *Frontend) renderPackageFailure(result SuiteResult) {
-	for _, line := range result.PackageOutput {
+// renderPackageOutput renders package-level output kept from a failed suite.
+func (f *Frontend) renderPackageOutput(lines []string) {
+	for _, line := range lines {
 		if isFrameworkLine(line) || strings.HasPrefix(line, "FAIL") {
 			continue
 		}
 		fmt.Fprint(f.out, line)
 	}
-	if result.Err != "" {
-		fmt.Fprintf(f.out, "%s\n", result.Err)
+}
+
+// renderPackageError renders a package-level runner error.
+func (f *Frontend) renderPackageError(errText string) {
+	if errText != "" {
+		fmt.Fprintf(f.out, "%s\n", errText)
 	}
 }
 
 // status renders one status line.
 func (f *Frontend) status(color string, verb string, format string, args ...any) {
 	fmt.Fprintf(f.out, "%s %s\n", f.paint(color, verb), fmt.Sprintf(format, args...))
-}
-
-// markStatusDirty requests the next ticker-owned sticky-region repaint.
-func (f *Frontend) markStatusDirty() {
-	f.statusDirty = true
 }
 
 // preparePermanentOutput clears an already drawn region before direct writes.
@@ -755,26 +801,6 @@ func (f *Frontend) preparePermanentOutput() {
 	}
 }
 
-// redrawStatus debounces sticky repaint work to the terminal ticker.
-func (f *Frontend) redrawStatus() {
-	if !f.statusDirty && (f.done >= f.total) {
-		return
-	}
-	f.erase()
-	f.draw()
-	f.statusDirty = false
-}
-
-// draw renders the sticky progress region when terminal mode is enabled.
-func (f *Frontend) draw() {
-	if !f.terminal || f.done >= f.total {
-		return
-	}
-	lines := f.progressLines(f.now())
-	fmt.Fprint(f.out, strings.Join(lines, "\n"))
-	f.linesDrawn = len(lines)
-}
-
 // progressLines returns the aggregate line plus capped running-suite rows.
 func (f *Frontend) progressLines(now time.Time) []string {
 	testsRun := f.passed + f.failed + f.ignored
@@ -782,9 +808,7 @@ func (f *Frontend) progressLines(now time.Time) []string {
 		f.done, f.total, testsRun, f.passed, f.failed, f.ignored,
 		formatRegionHeaderDuration(now.Sub(f.startedAt)))
 	lines := []string{f.progressHeader(line)}
-	for _, suite := range f.runningSuiteRows(now) {
-		lines = append(lines, suite)
-	}
+	lines = append(lines, f.runningSuiteRows(now)...)
 	return lines
 }
 
@@ -829,14 +853,15 @@ func (f *Frontend) erase() {
 	f.linesDrawn = 0
 }
 
-// writeProgressRows appends no-wrap rows after the frame-wide clear.
-func writeProgressRows(out *bytes.Buffer, rows []string) {
+// writeProgressRows appends no-wrap rows and returns the actual row count drawn.
+func writeProgressRows(out *bytes.Buffer, rows []string) int {
 	for index, line := range rows {
 		if index > 0 {
 			out.WriteString("\n")
 		}
 		out.WriteString(line)
 	}
+	return len(rows)
 }
 
 // eventCompletesRun reports events that must flush without waiting for a tick.

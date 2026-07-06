@@ -238,6 +238,21 @@ func TestRunSuiteProgressSurvivesListFailure(t *testing.T) {
 	}
 }
 
+// TestRunSuitePreservesShuffleSeedPackageOutput pins go's package-level shuffle event.
+func TestRunSuitePreservesShuffleSeedPackageOutput(t *testing.T) {
+	suite := suiteForTest("example.com/m/shuffled")
+	tool := &fakeTool{streams: map[string]string{suite.Package.ImportPath: `{"Action":"output","Output":"-test.shuffle 12345\n"}` + "\n" +
+		`{"Action":"run","Test":"TestBad"}` + "\n" +
+		`{"Action":"output","Test":"TestBad","Output":"boom\n"}` + "\n" +
+		`{"Action":"fail","Test":"TestBad"}` + "\n" +
+		`{"Action":"fail","Elapsed":0.01}` + "\n"}}
+	result := runSuite(context.Background(), tool, "/tmp", suite, time.Second, nil)
+	if !result.Failed || len(result.PackageOutput) != 1 ||
+		result.PackageOutput[0] != "-test.shuffle 12345\n" {
+		t.Fatalf("result = %+v, want retained package shuffle seed", result)
+	}
+}
+
 // suiteForTest returns a runner suite with a valid cache-shaped digest.
 func suiteForTest(importPath string) SuiteTask {
 	return SuiteTask{
@@ -250,7 +265,6 @@ func suiteForTest(importPath string) SuiteTask {
 type fakeTool struct {
 	streams  map[string]string
 	readers  map[string]readerFactory
-	waits    map[string]error
 	stderr   map[string]string
 	listed   map[string][]string
 	listErrs map[string]error
@@ -297,7 +311,7 @@ func (f *fakeTool) StartTests(ctx context.Context, _ string, importPath string) 
 	}
 	if reader, ok := f.readers[importPath]; ok {
 		return fakeProcess{
-			events: reader(ctx), wait: f.waits[importPath], stderr: f.stderr[importPath],
+			events: reader(ctx), stderr: f.stderr[importPath],
 		}, nil
 	}
 	stream, ok := f.streams[importPath]
@@ -305,14 +319,13 @@ func (f *fakeTool) StartTests(ctx context.Context, _ string, importPath string) 
 		return nil, fmt.Errorf("missing stream for %s", importPath)
 	}
 	return fakeProcess{
-		events: strings.NewReader(stream), wait: f.waits[importPath], stderr: f.stderr[importPath],
+		events: strings.NewReader(stream), stderr: f.stderr[importPath],
 	}, nil
 }
 
 // fakeProcess implements gotool.TestProcess for runner tests.
 type fakeProcess struct {
 	events io.Reader
-	wait   error
 	stderr string
 }
 
@@ -321,9 +334,9 @@ func (p fakeProcess) Events() io.Reader {
 	return p.events
 }
 
-// Wait returns the configured process wait error.
+// Wait succeeds because runner tests exercise event parsing, not process errors.
 func (p fakeProcess) Wait() error {
-	return p.wait
+	return nil
 }
 
 // Stderr returns the configured stderr text.

@@ -14,12 +14,6 @@ import (
 )
 
 const (
-	// dirEnvVar names the environment variable that overrides the disk cache root.
-	dirEnvVar = "RASK_CACHE_DIR"
-
-	// dirName is the cache directory name under the user cache directory.
-	dirName = "rask"
-
 	// cacheDirTag is the two-line CACHEDIR.TAG payload that proves rask owns the
 	// store. Destructive paths validate both lines immediately before deletion.
 	cacheDirTag = "Signature: 8a477f597d28d172789f06886806bc55\n" +
@@ -37,17 +31,20 @@ type diskStore struct {
 	rootDir string
 }
 
-// openObjectStore opens the default disk object store.
-func openObjectStore() (objectStore, error) {
-	rootDir := os.Getenv(dirEnvVar)
-	if rootDir == "" {
-		base, err := os.UserCacheDir()
-		if err != nil {
-			return nil, fmt.Errorf("resolving user cache dir: %w", err)
-		}
-		rootDir = filepath.Join(base, dirName)
+// openObjectStore wires the always-on disk store to any configured remote tier.
+func openObjectStore(cfg Config) (objectStore, error) {
+	disk, err := newDiskStore(cfg.DiskDir)
+	if err != nil {
+		return nil, err
 	}
-	return newDiskStore(rootDir)
+	remote, err := openS3ObjectStore(cfg.Remote)
+	if err != nil {
+		return nil, err
+	}
+	if remote == nil {
+		return disk, nil
+	}
+	return newTieredStore(disk, remote), nil
 }
 
 // newDiskStore opens a disk store rooted at rootDir and writes CACHEDIR.TAG.

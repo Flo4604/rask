@@ -252,7 +252,7 @@ func (SystemTool) ListTests(ctx context.Context, moduleDir string, importPath st
 
 // runGoListTests executes the test lister with test-process cancellation rules.
 func runGoListTests(ctx context.Context, moduleDir string, importPath string) ([]byte, string, error) {
-	command := exec.CommandContext(ctx, "go", "test", "-list", ListTestsPattern, importPath)
+	command := exec.CommandContext(ctx, "go", goListTestArguments(importPath)...)
 	command.Dir = moduleDir
 	command.WaitDelay = testProcessWaitDelay
 	configureTestCommandCancel(command)
@@ -262,6 +262,11 @@ func runGoListTests(ctx context.Context, moduleDir string, importPath string) ([
 	command.Stderr = &stderr
 	err := command.Run()
 	return stdout.Bytes(), strings.TrimSpace(stderr.String()), err
+}
+
+// goListTestArguments returns the fixed test-list invocation for progress totals.
+func goListTestArguments(importPath string) []string {
+	return []string{"test", "-list", ListTestsPattern, importPath}
 }
 
 // parseListedTests filters the package summary printed after listed test names.
@@ -319,14 +324,20 @@ func SaltEnvironment(environment []byte) []byte {
 	return filtered
 }
 
-// StartTests starts `go test -json -count=1 -failfast` for one package.
+// StartTests starts `go test -json -count=1 -failfast -shuffle=on` for one package.
 //
 // `-count=1` disables the Go test cache because rask owns result caching. The
+// `-shuffle=on` flag makes intra-suite order random on every stale execution. The
 // process is bound to ctx through [exec.CommandContext], and gotool installs
 // the cancellation policy so fail-fast and watchdog kills reap the whole
 // process tree started by `go test`.
 func (SystemTool) StartTests(ctx context.Context, moduleDir string, importPath string) (TestProcess, error) {
-	return startTestProcess(ctx, moduleDir, "go", "test", "-json", "-count=1", "-failfast", importPath)
+	return startTestProcess(ctx, moduleDir, "go", goTestArguments(importPath)...)
+}
+
+// goTestArguments returns the fixed test invocation rask uses for stale suites.
+func goTestArguments(importPath string) []string {
+	return []string{"test", "-json", "-count=1", "-failfast", "-shuffle=on", importPath}
 }
 
 // startTestProcess starts one streaming test command with rask cancellation.

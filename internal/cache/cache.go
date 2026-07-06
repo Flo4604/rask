@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/chronark/rask/internal/assert"
+	appconfig "github.com/chronark/rask/internal/config"
 )
 
 const (
@@ -45,6 +46,18 @@ const (
 	objectBytesMax = 16 << 10
 )
 
+// Config carries cache construction inputs resolved by the command edge.
+type Config struct {
+	// ModulePath keeps cache keys stable for one Go module.
+	ModulePath string
+
+	// DiskDir is explicit so cache construction never falls back to a user directory.
+	DiskDir string
+
+	// Remote is nil unless the process-edge config opted into the shared tier.
+	Remote *appconfig.Remote
+}
+
 // Cache stores passing suite summaries under a module-specific prefix.
 //
 // Cache has no channels because cache lookups are request/response operations
@@ -54,15 +67,27 @@ const (
 type Cache struct {
 	store        objectStore
 	modulePrefix string
+	remote       bool
 }
 
-// OpenResultCache opens the default disk-backed cache for modulePath.
-func OpenResultCache(modulePath string) (*Cache, error) {
-	store, err := openObjectStore()
+// RemoteStats is a snapshot of successful remote cache traffic.
+type RemoteStats struct {
+	// Reads is the number of validated cache hits served by the remote tier.
+	Reads int
+
+	// Writes is the number of successful writes to the remote tier.
+	Writes int
+}
+
+// Open constructs a module cache from already-resolved process configuration.
+func Open(cfg Config) (*Cache, error) {
+	assert.True(cfg.ModulePath != "", "cache module path is required")
+	assert.True(cfg.DiskDir != "", "cache disk dir is required")
+	store, err := openObjectStore(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return newResultCache(store, modulePath), nil
+	return newResultCache(store, cfg.ModulePath), nil
 }
 
 // Run waits for ctx cancellation and then prunes this module shard once.
@@ -135,6 +160,19 @@ func (c *Cache) RemoveModule() error {
 	return c.store.RemovePrefix(c.modulePrefix)
 }
 
+// HasRemoteTier reports whether this cache also writes to a remote tier.
+func (c *Cache) HasRemoteTier() bool {
+	return c.remote
+}
+
+// RemoteStats returns successful remote cache traffic for this cache.
+func (c *Cache) RemoteStats() RemoteStats {
+	if store, ok := c.store.(*tieredStore); ok {
+		return store.RemoteStats()
+	}
+	return RemoteStats{}
+}
+
 // Entry records the passing result summary stored for one suite digest.
 type Entry struct {
 	// ImportPath is the package import path that produced this cached result.
@@ -153,17 +191,18 @@ type Entry struct {
 	CreatedAt time.Time
 }
 
-// CleanAll removes rask-owned version directories and the cache tag from the store.
-func CleanAll() error {
-	store, err := openObjectStore()
+// CleanAll removes rask-owned version directories and the cache tag from one disk root.
+func CleanAll(diskDir string) error {
+	assert.True(diskDir != "", "cache disk dir is required")
+	store, err := newDiskStore(diskDir)
 	if err != nil {
 		return err
 	}
 	return store.RemovePrefix("")
 }
 
-// objectStore is the minimal storage contract used by [Cache].
-type objectStore interface {
+// store is the minimal storage contract used by cache pruning and test fakes.
+type store interface {
 	// Get returns a copied body, whether the key was found, and storage errors.
 	Get(key string) ([]byte, bool, error)
 
@@ -173,17 +212,22 @@ type objectStore interface {
 	// Delete removes key and should treat a missing object as success.
 	Delete(key string) error
 
-	// Touch updates key's last-used timestamp.
-	Touch(key string) error
-
 	// List returns objects under prefix with last-used timestamps.
 	List(prefix string) ([]storedObject, error)
+}
+
+// objectStore is the internal storage contract used by [Cache].
+type objectStore interface {
+	store
+
+	// Touch updates key's last-used timestamp.
+	Touch(key string) error
 
 	// RemovePrefix removes every object under prefix.
 	RemovePrefix(prefix string) error
 }
 
-// storedObject describes one object returned by an object-store listing.
+// storedObject keeps listing metadata package-local so storage details do not leak.
 type storedObject struct {
 	// Key is the slash-separated object key relative to the store root.
 	Key string
@@ -195,36 +239,51 @@ type storedObject struct {
 // newResultCache returns a module-sharded cache over store.
 func newResultCache(store objectStore, modulePath string) *Cache {
 	assert.NotNil(store)
-	digest := sha256.Sum256([]byte(modulePath))
-	moduleKey := hex.EncodeToString(digest[:])[:moduleKeyHexLength]
-	return &Cache{store: store, modulePrefix: formatVersion + "/" + moduleKey}
+	moduleKey := moduleKeyForPath(modulePath)
+	return &Cache{
+		store:        store,
+		modulePrefix: formatVersion + "/" + moduleKey,
+		remote:       storeHasRemote(store),
+	}
 }
 
 // objectKey returns the object-store key for a suite digest.
 func (c *Cache) objectKey(digest string) string {
-	assert.Equal(len(digest), hashHexLength)
-	assert.False(strings.ContainsAny(digest, "/\\."))
-	return c.modulePrefix + "/" + digest[:2] + "/" + digest + ".json"
+	assert.True(validDigest(digest), "malformed digest %q", digest)
+	parts := strings.Split(c.modulePrefix, "/")
+	assert.Equal(len(parts), 2)
+	return objectKeyForParts(parts[1], digest)
 }
 
 // prune removes old and excess objects from this module's cache shard.
 func (c *Cache) prune(now time.Time, ageMax time.Duration, countMax int) error {
-	objects, err := c.store.List(c.modulePrefix)
+	return pruneStorePrefix(c.store, c.modulePrefix, now, ageMax, countMax)
+}
+
+// pruneStorePrefix applies age and count bounds to one module shard.
+func pruneStorePrefix(
+	store store,
+	prefix string,
+	now time.Time,
+	ageMax time.Duration,
+	countMax int,
+) error {
+	objects, err := store.List(prefix)
 	if err != nil {
 		return err
 	}
-	kept := c.pruneByAge(objects, now.Add(-ageMax))
-	c.pruneByCount(kept, countMax)
+	kept := pruneStoreByAge(store, objects, now.Add(-ageMax))
+	pruneStoreByCount(store, kept, countMax)
 	return nil
 }
 
-// pruneByAge deletes stale JSON and crash-orphaned temp objects before cutoff.
-func (c *Cache) pruneByAge(objects []storedObject, cutoff time.Time) []storedObject {
+// pruneStoreByAge deletes stale JSON and crash-orphaned temp objects before cutoff.
+func pruneStoreByAge(store store, objects []storedObject, cutoff time.Time) []storedObject {
 	kept := make([]storedObject, 0, len(objects))
 	for _, object := range objects {
 		if temporaryObject(object.Key) {
 			if object.LastUsedAt.Before(cutoff) {
-				_ = c.store.Delete(object.Key)
+				_ = store.Delete(object.Key)
 			}
 			continue
 		}
@@ -232,7 +291,7 @@ func (c *Cache) pruneByAge(objects []storedObject, cutoff time.Time) []storedObj
 			continue
 		}
 		if object.LastUsedAt.Before(cutoff) {
-			_ = c.store.Delete(object.Key)
+			_ = store.Delete(object.Key)
 			continue
 		}
 		kept = append(kept, object)
@@ -240,8 +299,8 @@ func (c *Cache) pruneByAge(objects []storedObject, cutoff time.Time) []storedObj
 	return kept
 }
 
-// pruneByCount deletes oldest objects until at most countMax remain.
-func (c *Cache) pruneByCount(objects []storedObject, countMax int) {
+// pruneStoreByCount deletes oldest objects until at most countMax remain.
+func pruneStoreByCount(store store, objects []storedObject, countMax int) {
 	if len(objects) <= countMax {
 		return
 	}
@@ -249,7 +308,7 @@ func (c *Cache) pruneByCount(objects []storedObject, countMax int) {
 		return objects[a].LastUsedAt.Before(objects[b].LastUsedAt)
 	})
 	for _, object := range objects[:len(objects)-countMax] {
-		_ = c.store.Delete(object.Key)
+		_ = store.Delete(object.Key)
 	}
 }
 
@@ -267,4 +326,46 @@ func entryValid(entry Entry) bool {
 // temporaryObject reports crash-orphaned write-then-rename cache files.
 func temporaryObject(key string) bool {
 	return strings.Contains(filepath.Base(key), ".tmp.")
+}
+
+// moduleKeyForPath returns the stable module shard used by every backend.
+func moduleKeyForPath(modulePath string) string {
+	digest := sha256.Sum256([]byte(modulePath))
+	return hex.EncodeToString(digest[:])[:moduleKeyHexLength]
+}
+
+// objectKeyForParts returns the disk object key for validated module and digest parts.
+func objectKeyForParts(moduleKey string, digest string) string {
+	assert.True(validModuleKey(moduleKey), "malformed module key %q", moduleKey)
+	assert.True(validDigest(digest), "malformed digest %q", digest)
+	return formatVersion + "/" + moduleKey + "/" + digest[:2] + "/" + digest + ".json"
+}
+
+// validModuleKey reports whether key is a cache-safe module shard.
+func validModuleKey(key string) bool {
+	return validHex(key, moduleKeyHexLength)
+}
+
+// validDigest reports whether digest is a cache-safe suite digest.
+func validDigest(digest string) bool {
+	return validHex(digest, hashHexLength)
+}
+
+// validHex accepts only fixed-width lowercase hex without path metacharacters.
+func validHex(value string, length int) bool {
+	if len(value) != length || strings.ContainsAny(value, "/\\.") {
+		return false
+	}
+	for _, r := range value {
+		if !('0' <= r && r <= '9') && !('a' <= r && r <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// storeHasRemote reports whether store includes the optional remote tier.
+func storeHasRemote(store objectStore) bool {
+	_, ok := store.(*tieredStore)
+	return ok
 }

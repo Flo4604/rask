@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -164,6 +165,27 @@ func TestFingerprinterBlockedSendUnblocksOnCancel(t *testing.T) {
 	}
 }
 
+// TestFingerprintWithRandPermutesReadySuites protects inter-suite order draws.
+func TestFingerprintWithRandPermutesReadySuites(t *testing.T) {
+	module, packages := fingerprintFixture(t)
+	first := fingerprintOrderForTest(t, module, packages, rand.New(rand.NewPCG(1, 101)))
+	second := fingerprintOrderForTest(t, module, packages, rand.New(rand.NewPCG(2, 102)))
+	if fmt.Sprint(first) == fmt.Sprint(second) {
+		t.Fatalf("orders matched: %v", first)
+	}
+}
+
+// TestFingerprintReadyQueueShufflePreservesDependencies protects topological emission.
+func TestFingerprintReadyQueueShufflePreservesDependencies(t *testing.T) {
+	module, packages := fingerprintFixture(t)
+	for seed := uint64(1); seed <= 100; seed++ {
+		order := fingerprintOrderForTest(t, module, packages, rand.New(rand.NewPCG(seed, seed+100)))
+		if err := dependencyOrderError(packages, order); err != nil {
+			t.Fatalf("seed %d order %v: %v", seed, order, err)
+		}
+	}
+}
+
 // moduleFixtureRoot creates a minimal module directory for fingerprint tests.
 func moduleFixtureRoot(t *testing.T) gotool.Module {
 	t.Helper()
@@ -264,7 +286,7 @@ func fingerprintsWithToolForTest(
 	packages []gotool.Package,
 ) map[string]string {
 	t.Helper()
-	suites, err := fingerprint(tool, module, packages)
+	suites, err := fingerprintWithRand(tool, module, packages, rand.New(rand.NewPCG(1, 2)))
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -273,6 +295,41 @@ func fingerprintsWithToolForTest(
 		result[suite.Package.ImportPath] = suite.Digest
 	}
 	return result
+}
+
+// fingerprintOrderForTest returns suite import paths for a seeded fingerprint run.
+func fingerprintOrderForTest(
+	t *testing.T,
+	module gotool.Module,
+	packages []gotool.Package,
+	rand *rand.Rand,
+) []string {
+	t.Helper()
+	suites, err := fingerprintWithRand(&fakeTool{}, module, packages, rand)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	order := make([]string, 0, len(suites))
+	for _, suite := range suites {
+		order = append(order, suite.Package.ImportPath)
+	}
+	return order
+}
+
+// dependencyOrderError reports the first dependency ordering violation.
+func dependencyOrderError(packages []gotool.Package, order []string) error {
+	position := make(map[string]int, len(order))
+	for index, importPath := range order {
+		position[importPath] = index
+	}
+	for _, p := range packages {
+		for _, dep := range p.Imports {
+			if position[p.ImportPath] <= position[dep] {
+				return fmt.Errorf("%s preceded dependency %s", p.ImportPath, dep)
+			}
+		}
+	}
+	return nil
 }
 
 // fakeTool provides stable Go environment bytes for fingerprint tests.

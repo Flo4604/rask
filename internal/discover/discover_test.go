@@ -3,6 +3,7 @@ package discover
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -123,6 +124,23 @@ func TestDiscoverMergesLocalReplacePackagesUnselected(t *testing.T) {
 	}
 }
 
+// TestDiscovererShufflesEmissionOrder protects inter-suite package randomization.
+func TestDiscovererShufflesEmissionOrder(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	packages := []gotool.Package{
+		packageFixture(module, "a"), packageFixture(module, "b"), packageFixture(module, "c"),
+		packageFixture(module, "d"), packageFixture(module, "e"), packageFixture(module, "f"),
+	}
+	first := discoverOrderForTest(t, module, packages, rand.New(rand.NewPCG(1, 101)))
+	second := discoverOrderForTest(t, module, packages, rand.New(rand.NewPCG(2, 102)))
+	if strings.Join(first, ",") == strings.Join(second, ",") {
+		t.Fatalf("orders matched: %v", first)
+	}
+	if sameSet(first, second) != nil {
+		t.Fatalf("orders contain different packages: %v vs %v", first, second)
+	}
+}
+
 // TestDiscoverRejectsBrokenAdditionalRoot protects clear local-root failures.
 func TestDiscoverRejectsBrokenAdditionalRoot(t *testing.T) {
 	module := moduleFixtureRootWithGoMod(t, "module example.com/m\n\ngo 1.26\n\nreplace example.com/dep => ../missing\n")
@@ -226,13 +244,50 @@ func packagesByPath(packages []gotool.Package) map[string]gotool.Package {
 	return byPath
 }
 
+// discoverOrderForTest returns package emission order from a seeded discoverer.
+func discoverOrderForTest(
+	t *testing.T,
+	module gotool.Module,
+	packages []gotool.Package,
+	rand *rand.Rand,
+) []string {
+	t.Helper()
+	out := make(chan gotool.Package, len(packages))
+	tool := &fakeTool{all: append([]gotool.Package(nil), packages...)}
+	discoverer := newWithRand(tool, module, module.Dir, []string{"./..."}, out, rand)
+	if err := discoverer.Run(context.Background()); err != nil {
+		t.Fatalf("discover: %v", err)
+	}
+	order := make([]string, 0, len(packages))
+	for p := range out {
+		order = append(order, p.ImportPath)
+	}
+	return order
+}
+
+// sameSet reports a missing item when two string slices differ as sets.
+func sameSet(first []string, second []string) error {
+	counts := make(map[string]int, len(first))
+	for _, item := range first {
+		counts[item]++
+	}
+	for _, item := range second {
+		counts[item]--
+	}
+	for item, count := range counts {
+		if count != 0 {
+			return fmt.Errorf("%s count delta %d", item, count)
+		}
+	}
+	return nil
+}
+
 // fakeTool records package-listing calls for discovery tests.
 type fakeTool struct {
 	selected     []gotool.Package
 	all          []gotool.Package
 	allByDir     map[string][]gotool.Package
 	listErrByDir map[string]error
-	modules      []gotool.Module
 	calls        map[string]int
 	dirs         map[string]string
 }
@@ -265,9 +320,9 @@ func (f *fakeTool) ListPackages(dir string, patterns []string) ([]gotool.Package
 	return f.selected, nil
 }
 
-// ListModules returns configured workspace modules for discovery tests.
+// ListModules fails because discovery tests receive modules directly.
 func (f *fakeTool) ListModules(string) ([]gotool.Module, error) {
-	return f.modules, nil
+	return nil, fmt.Errorf("unexpected ListModules call")
 }
 
 // Environment returns a stable fake Go environment for local-root enumeration.

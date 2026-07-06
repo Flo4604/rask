@@ -14,11 +14,13 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/chronark/rask/internal/assert"
 	"github.com/chronark/rask/internal/gotool"
@@ -35,6 +37,7 @@ type Discoverer struct {
 	patternDir string
 	patterns   []string
 	out        chan<- gotool.Package
+	rand       *rand.Rand
 }
 
 // New returns a discoverer that emits package metadata to out.
@@ -47,7 +50,22 @@ func New(
 ) *Discoverer {
 	assert.NotNil(tool, "discovery needs a go tool")
 	assert.NotNil(out, "discovery needs a package channel")
-	return &Discoverer{tool: tool, module: module, patternDir: patternDir, patterns: patterns, out: out}
+	return newWithRand(tool, module, patternDir, patterns, out, randomRand())
+}
+
+// newWithRand returns a discoverer using rand for emission-order shuffling.
+func newWithRand(
+	tool gotool.Tool,
+	module gotool.Module,
+	patternDir string,
+	patterns []string,
+	out chan<- gotool.Package,
+	rng *rand.Rand,
+) *Discoverer {
+	assert.NotNil(rng, "discovery needs a random source")
+	return &Discoverer{
+		tool: tool, module: module, patternDir: patternDir, patterns: patterns, out: out, rand: rng,
+	}
 }
 
 // Run discovers packages, emits them to the package channel, and closes it.
@@ -61,6 +79,7 @@ func (d *Discoverer) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	shufflePackages(packages, d.rand)
 	for _, p := range packages {
 		select {
 		case d.out <- p:
@@ -69,6 +88,19 @@ func (d *Discoverer) Run(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// randomRand returns a fresh process-local pseudo-random source.
+func randomRand() *rand.Rand {
+	seed := uint64(time.Now().UnixNano())
+	return rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
+}
+
+// shufflePackages permutes package emission order in place.
+func shufflePackages(packages []gotool.Package, rng *rand.Rand) {
+	rng.Shuffle(len(packages), func(i int, j int) {
+		packages[i], packages[j] = packages[j], packages[i]
+	})
 }
 
 // discover returns the full package closure with selected packages marked.

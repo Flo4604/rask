@@ -4,10 +4,27 @@ package main
 import (
 	"os"
 
-	"github.com/chronark/rask/internal/cmd"
+	"github.com/chronark/rask/cmd/clean"
+	testcmd "github.com/chronark/rask/cmd/test"
+	"github.com/chronark/rask/internal/cli"
+	"github.com/chronark/rask/internal/setup"
 )
 
-// main passes process arguments to [cmd.Execute] and exits with its code.
+// main assembles the root command and exits with its code.
 func main() {
-	os.Exit(cmd.Execute(os.Args))
+	testCommand := testcmd.Command()
+	app := &cli.Command{
+		Name:               "rask",
+		Usage:              "Run Go tests with content-addressed result caching",
+		Description:        "Testing takes package patterns plus -v/--verbose and --no-cache.",
+		Flags:              testCommand.Flags,
+		Action:             testCommand.Action,
+		AcceptsArgs:        true,
+		DefaultActionNames: []string{"test", "t"},
+		UnknownFlagHint:    "rask supports only -v/--verbose and --no-cache; use `go test` for other flags",
+		Commands: []*cli.Command{
+			clean.Command(),
+		},
+	}
+	os.Exit(setup.Execute(app, os.Args))
 }
