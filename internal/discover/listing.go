@@ -8,74 +8,58 @@ import (
 	"github.com/chronark/rask/internal/gotool"
 )
 
-// discover builds the validated closure and marks packages matched by patterns.
-func discover(
-	tool gotool.Tool,
-	module gotool.Module,
-	patternDir string,
-	patterns []string,
-) ([]gotool.Package, error) {
-	roots, err := LocalModuleRoots(tool, module)
+// discover builds the validated closure before Run decides emission order.
+func (d *Discoverer) discover() ([]gotool.Package, error) {
+	roots, err := LocalModuleRoots(d.tool, d.module)
 	if err != nil {
 		return nil, err
 	}
-	selected, err := listSelectedPackages(tool, patternDir, patterns)
+	selected, err := d.listSelected()
 	if err != nil {
 		return nil, err
 	}
-	closure, err := listMainClosure(tool, module, patterns, selected)
+	closure, err := d.listMainClosure(selected)
 	if err != nil {
 		return nil, err
 	}
-	closure, err = appendAdditionalRootPackages(tool, closure, roots, module.Dir)
+	closure, err = d.appendAdditionalRoots(closure, roots)
 	if err != nil {
 		return nil, err
 	}
-	return validateAndMarkClosure(module, closure, selected)
+	return d.validateAndMark(closure, selected)
 }
 
-// listSelectedPackages rejects zero-package pattern matches before hashing.
-func listSelectedPackages(
-	tool gotool.Tool,
-	patternDir string,
-	patterns []string,
-) ([]gotool.Package, error) {
-	selected, err := tool.ListPackages(patternDir, patterns)
+// listSelected rejects zero-package pattern matches before hashing.
+func (d *Discoverer) listSelected() ([]gotool.Package, error) {
+	selected, err := d.tool.ListPackages(d.patternDir, d.patterns)
 	if err != nil {
 		return nil, err
 	}
 	if len(selected) == 0 {
-		return nil, fmt.Errorf("package pattern %s matched no packages", strings.Join(patterns, " "))
+		return nil, fmt.Errorf("package pattern %s matched no packages", strings.Join(d.patterns, " "))
 	}
 	return selected, nil
 }
 
-// listMainClosure reuses the selection walk when the user asked for ./....
-func listMainClosure(
-	tool gotool.Tool,
-	module gotool.Module,
-	patterns []string,
-	selected []gotool.Package,
-) ([]gotool.Package, error) {
-	if wholeModulePattern(patterns) {
-		return markModuleDir(selected, module.Dir), nil
+// listMainClosure reuses the selection walk when it already covers the module.
+func (d *Discoverer) listMainClosure(selected []gotool.Package) ([]gotool.Package, error) {
+	if wholeModulePattern(d.patterns) {
+		return markModuleDir(selected, d.module.Dir), nil
 	}
-	packages, err := tool.ListPackages(module.Dir, []string{"./..."})
+	packages, err := d.tool.ListPackages(d.module.Dir, []string{"./..."})
 	if err != nil {
 		return nil, err
 	}
-	return markModuleDir(packages, module.Dir), nil
+	return markModuleDir(packages, d.module.Dir), nil
 }
 
-// appendAdditionalRootPackages includes local replace and workspace modules.
-func appendAdditionalRootPackages(
-	tool gotool.Tool,
+// appendAdditionalRoots includes local replace and workspace modules.
+func (d *Discoverer) appendAdditionalRoots(
 	closure []gotool.Package,
 	roots []string,
-	mainRoot string,
 ) ([]gotool.Package, error) {
-	for _, root := range additionalRoots(roots, mainRoot) {
-		packages, err := listAdditionalRoot(tool, root)
+	for _, root := range additionalRoots(roots, d.module.Dir) {
+		packages, err := d.listAdditionalRoot(root)
 		if err != nil {
 			return nil, err
 		}
@@ -85,8 +69,8 @@ func appendAdditionalRootPackages(
 }
 
 // listAdditionalRoot wraps local-root go-list failures with the root path.
-func listAdditionalRoot(tool gotool.Tool, root string) ([]gotool.Package, error) {
-	packages, err := tool.ListPackages(root, []string{"./..."})
+func (d *Discoverer) listAdditionalRoot(root string) ([]gotool.Package, error) {
+	packages, err := d.tool.ListPackages(root, []string{"./..."})
 	if err != nil {
 		return nil, fmt.Errorf("listing local module root %s: %w", root, err)
 	}

@@ -61,7 +61,7 @@ func newWithRand(
 // Run discovers packages, emits them with cancellation, and closes out.
 func (d *Discoverer) Run(ctx context.Context) error {
 	defer close(d.out)
-	packages, err := discover(d.tool, d.module, d.patternDir, d.patterns)
+	packages, err := d.discover()
 	if err != nil {
 		return err
 	}

@@ -16,7 +16,7 @@ import (
 func TestDiscoverListsWholeModuleOnceForDefaultPattern(t *testing.T) {
 	module := moduleFixtureRoot(t)
 	tool := &fakeTool{all: []gotool.Package{packageFixture(module, "app")}}
-	packages, err := discover(tool, module, module.Dir, []string{"./..."})
+	packages, err := discoverForTest(tool, module, module.Dir, []string{"./..."})
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestDiscoverMarksSelectedWithinFullClosure(t *testing.T) {
 	app.Selected = false
 	lib := packageFixture(module, "lib")
 	tool := &fakeTool{selected: []gotool.Package{app}, all: []gotool.Package{lib, app}}
-	packages, err := discover(tool, module, module.Dir, []string{"./app"})
+	packages, err := discoverForTest(tool, module, module.Dir, []string{"./app"})
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -54,13 +54,13 @@ func TestDiscoverRejectsLoadAndSyntaxErrors(t *testing.T) {
 	module := moduleFixtureRoot(t)
 	broken := packageFixture(module, "broken")
 	broken.Error = &gotool.PackageError{Err: "expected '}', found EOF"}
-	_, err := discover(&fakeTool{all: []gotool.Package{broken}}, module, module.Dir, []string{"./..."})
+	_, err := discoverForTest(&fakeTool{all: []gotool.Package{broken}}, module, module.Dir, []string{"./..."})
 	if err == nil || !strings.Contains(err.Error(), module.Path+"/broken") {
 		t.Fatalf("err = %v, want package load error", err)
 	}
 	writeFile(t, module.Dir, "bad.go", "package bad\nfunc x() {")
 	bad := gotool.Package{Dir: module.Dir, ImportPath: module.Path, GoFiles: []string{"bad.go"}}
-	_, err = discover(&fakeTool{all: []gotool.Package{bad}}, module, module.Dir, []string{"./..."})
+	_, err = discoverForTest(&fakeTool{all: []gotool.Package{bad}}, module, module.Dir, []string{"./..."})
 	if err == nil || !strings.Contains(err.Error(), "package "+module.Path+" is broken") {
 		t.Fatalf("err = %v, want syntax error", err)
 	}
@@ -69,7 +69,7 @@ func TestDiscoverRejectsLoadAndSyntaxErrors(t *testing.T) {
 // TestDiscoverRejectsEmptyAndOutsideSelections protects zero-suite success cases.
 func TestDiscoverRejectsEmptyAndOutsideSelections(t *testing.T) {
 	module := moduleFixtureRoot(t)
-	_, err := discover(&fakeTool{}, module, module.Dir, []string{"./missing"})
+	_, err := discoverForTest(&fakeTool{}, module, module.Dir, []string{"./missing"})
 	if err == nil || !strings.Contains(err.Error(), "matched no packages") {
 		t.Fatalf("err = %v, want empty pattern error", err)
 	}
@@ -78,7 +78,7 @@ func TestDiscoverRejectsEmptyAndOutsideSelections(t *testing.T) {
 		GoFiles: []string{"pkg.go"}, Selected: true,
 	}
 	tool := &fakeTool{selected: []gotool.Package{outside}, all: []gotool.Package{packageFixture(module, "app")}}
-	_, err = discover(tool, module, module.Dir, []string{"../other"})
+	_, err = discoverForTest(tool, module, module.Dir, []string{"../other"})
 	if err == nil || !strings.Contains(err.Error(), "outside module "+module.Path) {
 		t.Fatalf("err = %v, want outside module error", err)
 	}
@@ -90,7 +90,7 @@ func TestDiscoverListsPatternsFromUserDir(t *testing.T) {
 	userDir := filepath.Join(module.Dir, "worker")
 	app := packageFixture(module, "worker/api")
 	tool := &fakeTool{selected: []gotool.Package{app}, all: []gotool.Package{app}}
-	if _, err := discover(tool, module, userDir, []string{"./api"}); err != nil {
+	if _, err := discoverForTest(tool, module, userDir, []string{"./api"}); err != nil {
 		t.Fatalf("discover: %v", err)
 	}
 	if got := tool.dirs["./api"]; got != userDir {
@@ -111,7 +111,7 @@ func TestDiscoverMergesLocalReplacePackagesUnselected(t *testing.T) {
 		module.Dir: {app},
 		dep.Dir:    {utility},
 	}}
-	packages, err := discover(tool, module, module.Dir, []string{"./..."})
+	packages, err := discoverForTest(tool, module, module.Dir, []string{"./..."})
 	if err != nil {
 		t.Fatalf("discover: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestDiscovererShufflesEmissionOrder(t *testing.T) {
 func TestDiscoverRejectsBrokenAdditionalRoot(t *testing.T) {
 	module := moduleFixtureRootWithGoMod(t, "module example.com/m\n\ngo 1.26\n\nreplace example.com/dep => ../missing\n")
 	app := packageFixture(module, "app")
-	_, err := discover(&fakeTool{all: []gotool.Package{app}}, module, module.Dir, []string{"./..."})
+	_, err := discoverForTest(&fakeTool{all: []gotool.Package{app}}, module, module.Dir, []string{"./..."})
 	if err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("err = %v, want missing root named", err)
 	}
@@ -160,7 +160,7 @@ func TestDiscoverRejectsAdditionalRootListFailure(t *testing.T) {
 		allByDir:     map[string][]gotool.Package{module.Dir: {app}},
 		listErrByDir: map[string]error{dep.Dir: fmt.Errorf("dep broken")},
 	}
-	_, err := discover(tool, module, module.Dir, []string{"./..."})
+	_, err := discoverForTest(tool, module, module.Dir, []string{"./..."})
 	if err == nil || !strings.Contains(err.Error(), dep.Dir) {
 		t.Fatalf("err = %v, want listed root named", err)
 	}
@@ -242,6 +242,22 @@ func packagesByPath(packages []gotool.Package) map[string]gotool.Package {
 		byPath[p.ImportPath] = p
 	}
 	return byPath
+}
+
+// discoverForTest keeps unit tests focused on discovery without channel emission.
+func discoverForTest(
+	tool gotool.Tool,
+	module gotool.Module,
+	patternDir string,
+	patterns []string,
+) ([]gotool.Package, error) {
+	discoverer := &Discoverer{
+		tool:       tool,
+		module:     module,
+		patternDir: patternDir,
+		patterns:   patterns,
+	}
+	return discoverer.discover()
 }
 
 // discoverOrderForTest returns package emission order from a seeded discoverer.

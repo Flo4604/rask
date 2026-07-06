@@ -13,9 +13,8 @@ import (
 	"github.com/chronark/rask/internal/gotool"
 )
 
-// validateAndMarkClosure enforces the package invariants fingerprinting trusts.
-func validateAndMarkClosure(
-	module gotool.Module,
+// validateAndMark enforces the package invariants fingerprinting trusts.
+func (d *Discoverer) validateAndMark(
 	closureListing []gotool.Package,
 	selected []gotool.Package,
 ) ([]gotool.Package, error) {
@@ -25,7 +24,7 @@ func validateAndMarkClosure(
 	if err := requirePackageIdentities(selected); err != nil {
 		return nil, err
 	}
-	if err := rejectOutsideModule(module, closureListing, selected); err != nil {
+	if err := rejectOutsideModule(d.module, closureListing, selected); err != nil {
 		return nil, err
 	}
 	closure := dedupeByImportPath(closureListing, selected)
