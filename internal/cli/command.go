@@ -76,6 +76,16 @@ func (c *Command) Bool(name string) bool {
 	return false
 }
 
+// Int returns zero for absent flags so startup validation owns domain bounds.
+func (c *Command) Int(name string) int {
+	if flag, ok := c.flagMap[name]; ok {
+		if intFlag, ok := flag.(*IntFlag); ok {
+			return intFlag.Value()
+		}
+	}
+	return 0
+}
+
 // Run executes the command with process-shaped arguments.
 func (c *Command) Run(ctx context.Context, args []string) error {
 	if len(args) == 0 {

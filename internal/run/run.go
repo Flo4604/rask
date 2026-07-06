@@ -50,8 +50,8 @@ const (
 	// lineBytesMax bounds one line read from `go test -json` stdout.
 	lineBytesMax = 4 << 20
 
-	// workerCountMax caps suite parallelism regardless of GOMAXPROCS.
-	workerCountMax = 32
+	// WorkerCountMax caps suite parallelism so user input cannot fan out unbounded processes.
+	WorkerCountMax = 32
 )
 
 // TestOutcome is the terminal state of one test reported by `go test -json`.
@@ -179,6 +179,7 @@ type Runner struct {
 	moduleDir string
 	in        <-chan SuiteTask
 	out       chan<- Event
+	workers   int
 }
 
 // New returns a runner connected to task and result channels.
@@ -187,8 +188,9 @@ func New(
 	moduleDir string,
 	in <-chan SuiteTask,
 	out chan<- Event,
+	workers int,
 ) *Runner {
-	return &Runner{tool: tool, moduleDir: moduleDir, in: in, out: out}
+	return &Runner{tool: tool, moduleDir: moduleDir, in: in, out: out, workers: workers}
 }
 
 // Run starts the bounded worker pool, consumes tasks, emits results, and closes them.
@@ -200,19 +202,22 @@ func New(
 func (r *Runner) Run(ctx context.Context) error {
 	defer close(r.out)
 	var wg sync.WaitGroup
-	for range workerPoolSize() {
+	for range r.workerPoolSize() {
 		wg.Go(func() { r.runWorker(ctx) })
 	}
 	wg.Wait()
 	return nil
 }
 
-// workerPoolSize returns GOMAXPROCS-1 clamped to [1, workerCountMax].
+// workerPoolSize preserves the automatic default unless startup fixed the pool.
 //
 // One CPU stays free so orchestration and rendering remain responsive while
 // suites run, and the cap bounds process fan-out on very wide machines.
-func workerPoolSize() int {
-	return min(workerCountMax, max(1, runtime.GOMAXPROCS(0)-1))
+func (r *Runner) workerPoolSize() int {
+	if r.workers > 0 {
+		return r.workers
+	}
+	return min(WorkerCountMax, max(1, runtime.GOMAXPROCS(0)-1))
 }
 
 // runWorker consumes tasks until the task subscription closes or ctx cancellation stops the pool.

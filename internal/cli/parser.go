@@ -95,6 +95,13 @@ func (c *Command) parseFlag(args []string, i *int) error {
 		}
 		return bf.Parse("")
 	}
+	if _, ok := flag.(*IntFlag); ok && !hasValue {
+		if *i+1 >= len(args) {
+			return fmt.Errorf("missing value for flag: %s", flagName)
+		}
+		(*i)++
+		flagValue = args[*i]
+	}
 	return flag.Parse(flagValue)
 }
 

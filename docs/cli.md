@@ -14,6 +14,7 @@ With no package patterns, rask uses `./...`.
 rask
 rask ./pkg/...
 rask -v ./pkg/... --no-cache
+rask --concurrency 4 ./...
 ```
 
 Options:
@@ -23,9 +24,10 @@ Options:
 | `-v` | Render passing and ignored test lines. |
 | `--verbose` | Render passing and ignored test lines. |
 | `--no-cache` | Bypass cache reads for this run and refresh passing suites. |
+| `--concurrency` | Set how many stale suites run at once. `0` or unset uses automatic sizing. |
 | `--version` | Print the rask version and exit before running tests. |
 
-rask always runs whole suites, always fails fast, and always randomizes order. Suites are scheduled in a randomized dependency-respecting order, and each stale suite runs `go test` with `-shuffle=on`. Failed suite output includes Go's `-test.shuffle <seed>` line when Go emits one, so a shuffled failure can be replayed directly with `go test -shuffle=<seed> <pkg>`. Filtered or customized runs such as `-run`, benchmarks, fuzzing, and coverage belong to plain `go test`. Unknown test flags are rejected with that hint.
+rask always runs whole suites, always fails fast, and always randomizes order. Suites are scheduled in a randomized dependency-respecting order, and each stale suite runs `go test` with `-shuffle=on`. `--concurrency` controls only how many suite-level `go test` processes rask starts at once; it does not change intra-suite Go test behavior. When `--concurrency` is unset or `0`, rask uses `min(32, max(1, GOMAXPROCS-1))`. Explicit values must be between `1` and `32`. Failed suite output includes Go's `-test.shuffle <seed>` line when Go emits one, so a shuffled failure can be replayed directly with `go test -shuffle=<seed> <pkg>`. Filtered or customized runs such as `-run`, benchmarks, fuzzing, and coverage belong to plain `go test`. Unknown test flags are rejected with that hint.
 
 ## `rask clean`
 

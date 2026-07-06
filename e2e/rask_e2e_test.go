@@ -72,6 +72,16 @@ func TestNoCacheFlag(t *testing.T) {
 	assertSuites(t, third.stdout, "Cached", "bystander", "dep", "dependent")
 }
 
+func TestConcurrencyFlag(t *testing.T) {
+	module := scaffoldModule(t, packageSpec{name: "dep", test: testPass})
+	success := runRask(t, module.dir, cacheEnv(t.TempDir()), "--concurrency", "1", "./...")
+	assertCode(t, success, 0)
+	assertSuites(t, success.stdout, "Passed", "dep")
+	failure := runRask(t, module.dir, cacheEnv(t.TempDir()), "--concurrency", "-1")
+	assertCode(t, failure, 1)
+	assertContains(t, failure.stderr, "--concurrency must be positive")
+}
+
 func TestCleanCommand(t *testing.T) {
 	module := scaffoldModule(t, demoPackages(false)...)
 	cacheDir := t.TempDir()

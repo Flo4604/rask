@@ -238,6 +238,37 @@ func TestRunSuiteProgressSurvivesListFailure(t *testing.T) {
 	}
 }
 
+// TestRunnerFixedWorkerCountRunsSequentially protects caller-owned suite parallelism.
+func TestRunnerFixedWorkerCountRunsSequentially(t *testing.T) {
+	first := suiteForTest("example.com/m/first")
+	second := suiteForTest("example.com/m/second")
+	releaseFirst := make(chan struct{})
+	tool := &fakeTool{readers: map[string]readerFactory{
+		first.Package.ImportPath: func(context.Context) io.Reader {
+			return &releasedReader{release: releaseFirst, body: passStream()}
+		},
+		second.Package.ImportPath: func(context.Context) io.Reader {
+			return strings.NewReader(passStream())
+		},
+	}}
+	tasks := make(chan SuiteTask, 2)
+	results := make(chan Event, 16)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	runner := New(tool, "/tmp", tasks, results, 1)
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	tasks <- first
+	tasks <- second
+	close(tasks)
+	wantStartedSuite(t, ctx, results, first)
+	assertNoSecondStartBeforeFirstResult(t, results, second)
+	close(releaseFirst)
+	wantResultBeforeStart(t, ctx, results, first, second)
+	wantStartedSuite(t, ctx, results, second)
+	waitRunnerDone(t, ctx, done)
+}
+
 // TestRunSuitePreservesShuffleSeedPackageOutput pins go's package-level shuffle event.
 func TestRunSuitePreservesShuffleSeedPackageOutput(t *testing.T) {
 	suite := suiteForTest("example.com/m/shuffled")
@@ -258,6 +289,80 @@ func suiteForTest(importPath string) SuiteTask {
 	return SuiteTask{
 		Package: gotool.Package{Dir: "/tmp", ImportPath: importPath, TestGoFiles: []string{"x_test.go"}},
 		Digest:  strings.Repeat("c", 64),
+	}
+}
+
+// passStream gives runner tests the smallest complete package result.
+func passStream() string {
+	return `{"Action":"pass","Elapsed":0.01}` + "\n"
+}
+
+// wantStartedSuite waits for a worker-start event for one suite.
+func wantStartedSuite(t *testing.T, ctx context.Context, events <-chan Event, suite SuiteTask) {
+	t.Helper()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("results closed before %s started", suite.Package.ImportPath)
+			}
+			if event.Kind == EventSuiteStarted && event.Suite.Package.ImportPath == suite.Package.ImportPath {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiting for %s start: %v", suite.Package.ImportPath, ctx.Err())
+		}
+	}
+}
+
+// assertNoSecondStartBeforeFirstResult proves workers=1 is not consuming task two yet.
+func assertNoSecondStartBeforeFirstResult(t *testing.T, events <-chan Event, second SuiteTask) {
+	t.Helper()
+	timer := time.NewTimer(30 * time.Millisecond)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-events:
+			if event.Kind == EventSuiteStarted && event.Suite.Package.ImportPath == second.Package.ImportPath {
+				t.Fatalf("second suite started before first suite completed")
+			}
+			if event.Kind == EventSuiteResult {
+				t.Fatalf("first suite completed before release")
+			}
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+// wantResultBeforeStart proves task two starts only after task one emits its result.
+func wantResultBeforeStart(t *testing.T, ctx context.Context, events <-chan Event, first SuiteTask, second SuiteTask) {
+	t.Helper()
+	for {
+		select {
+		case event := <-events:
+			if event.Kind == EventSuiteStarted && event.Suite.Package.ImportPath == second.Package.ImportPath {
+				t.Fatalf("second suite started before first suite result")
+			}
+			if event.Kind == EventSuiteResult && event.Result.Package.ImportPath == first.Package.ImportPath {
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("waiting for first result: %v", ctx.Err())
+		}
+	}
+}
+
+// waitRunnerDone waits for the runner to close after all controlled streams finish.
+func waitRunnerDone(t *testing.T, ctx context.Context, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner error: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("runner did not finish: %v", ctx.Err())
 	}
 }
 
@@ -342,6 +447,23 @@ func (p fakeProcess) Wait() error {
 // Stderr returns the configured stderr text.
 func (p fakeProcess) Stderr() string {
 	return p.stderr
+}
+
+// releasedReader blocks a fake suite until the test allows it to complete.
+type releasedReader struct {
+	release <-chan struct{}
+	body    string
+	sent    bool
+}
+
+// Read waits for release so tests can inspect runner scheduling first.
+func (r *releasedReader) Read(p []byte) (int, error) {
+	<-r.release
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	return copy(p, r.body), nil
 }
 
 // chunkReader returns one configured chunk per Read call.

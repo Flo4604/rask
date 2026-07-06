@@ -91,8 +91,45 @@ func TestExecuteReturnsOneForFlagError(t *testing.T) {
 	if !strings.Contains(errOut, "unknown flag") {
 		t.Fatalf("errOut=%q, want unknown flag error", errOut)
 	}
-	if !strings.Contains(errOut, "supports only -v/--verbose and --no-cache") {
+	if !strings.Contains(errOut, "supports only -v/--verbose, --no-cache, and --concurrency") {
 		t.Fatalf("errOut=%q, want supported-flag message", errOut)
+	}
+}
+
+// TestExecuteRejectsNegativeConcurrency protects startup validation before services exist.
+func TestExecuteRejectsNegativeConcurrency(t *testing.T) {
+	code, _, errOut := executeWithTool(t, &fakeTool{}, "--concurrency", "-1")
+	if code != 1 {
+		t.Fatalf("code=%d, want one", code)
+	}
+	if !strings.Contains(errOut, "--concurrency must be positive") {
+		t.Fatalf("errOut=%q, want concurrency validation", errOut)
+	}
+}
+
+// TestExecuteRejectsConcurrencyAboveCap protects the process fan-out bound.
+func TestExecuteRejectsConcurrencyAboveCap(t *testing.T) {
+	code, _, errOut := executeWithTool(t, &fakeTool{}, "--concurrency=33")
+	if code != 1 {
+		t.Fatalf("code=%d, want one", code)
+	}
+	if !strings.Contains(errOut, "--concurrency must be at most 32") {
+		t.Fatalf("errOut=%q, want cap validation", errOut)
+	}
+}
+
+// TestExecuteAllowsZeroConcurrency protects zero as the automatic sizing sentinel.
+func TestExecuteAllowsZeroConcurrency(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	t.Setenv("RASK_CACHE_DIR", t.TempDir())
+	passing := packageFixture(module, "passing")
+	writePackageFiles(t, passing)
+	tool := &fakeTool{module: module, all: []gotool.Package{passing}, streams: map[string]string{
+		passing.ImportPath: `{"Action":"pass","Elapsed":0.01}` + "\n",
+	}}
+	code, _, errOut := executeWithTool(t, tool, "--concurrency=0", "./...")
+	if code != 0 {
+		t.Fatalf("code=%d errOut=%q, want zero", code, errOut)
 	}
 }
 
@@ -191,7 +228,7 @@ func TestOrchestratorDrainsResultsWhileDispatchingTasks(t *testing.T) {
 		resultCache: resultCache, tasks: tasks, results: results, events: events, resultsOpen: true,
 		summary: frontend.Summary{Suites: len(suites)},
 	}
-	runner := run.New(tool, module.Dir, tasks, results)
+	runner := run.New(tool, module.Dir, tasks, results, 0)
 	runnerDone := make(chan error, 1)
 	go func() {
 		runnerDone <- runner.Run(ctx)
@@ -235,7 +272,7 @@ func TestNoCacheBypassesHitsAndRefreshesPasses(t *testing.T) {
 	events = make(chan frontend.Event, eventChannelCapacity)
 	tool := &fakeTool{module: module, streams: passingStreams([]fingerprint.Suite{suite})}
 	command := noCacheCommandForTest(t, module, tool, resultCache, events)
-	runner := run.New(tool, module.Dir, command.tasks, command.results)
+	runner := run.New(tool, module.Dir, command.tasks, command.results, 0)
 	runnerDone := make(chan error, 1)
 	go func() { runnerDone <- runner.Run(command.ctx) }()
 	dispatchSuites(command, []fingerprint.Suite{suite})
@@ -504,12 +541,12 @@ func rootCommandForTest() *cli.Command {
 	return &cli.Command{
 		Name:               "rask",
 		Usage:              "Run Go tests with content-addressed result caching",
-		Description:        "Testing takes package patterns plus -v/--verbose and --no-cache.",
+		Description:        "Testing takes package patterns plus -v/--verbose, --no-cache, and --concurrency.",
 		Flags:              testCommand.Flags,
 		Action:             testCommand.Action,
 		AcceptsArgs:        true,
 		DefaultActionNames: []string{"test", "t"},
-		UnknownFlagHint:    "rask supports only -v/--verbose and --no-cache; use `go test` for other flags",
+		UnknownFlagHint:    "rask supports only -v/--verbose, --no-cache, and --concurrency; use `go test` for other flags",
 		Commands: []*cli.Command{
 			clean.Command(),
 		},

@@ -48,6 +48,68 @@ func TestParserDoubleDashStopsFlagParsing(t *testing.T) {
 	}
 }
 
+func TestParserAcceptsIntFlagEqualsValue(t *testing.T) {
+	var workers int
+	cmd := &Command{
+		Name:        "run",
+		AcceptsArgs: true,
+		Flags:       []Flag{Int("concurrency", "suite workers")},
+		Action: func(_ context.Context, c *Command) error {
+			workers = c.Int("concurrency")
+			return nil
+		},
+	}
+	err := cmd.parse(context.Background(), []string{"--concurrency=8", "./..."})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if workers != 8 || strings.Join(cmd.Args(), ",") != "./..." {
+		t.Fatalf("workers=%d args=%v, want workers=8 and pattern", workers, cmd.Args())
+	}
+}
+
+func TestParserAcceptsIntFlagSpaceValue(t *testing.T) {
+	var workers int
+	cmd := &Command{
+		Name:        "run",
+		AcceptsArgs: true,
+		Flags:       []Flag{Int("concurrency", "suite workers")},
+		Action: func(_ context.Context, c *Command) error {
+			workers = c.Int("concurrency")
+			return nil
+		},
+	}
+	err := cmd.parse(context.Background(), []string{"--concurrency", "-1"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if workers != -1 || len(cmd.Args()) != 0 {
+		t.Fatalf("workers=%d args=%v, want negative value and no args", workers, cmd.Args())
+	}
+}
+
+func TestParserRejectsInvalidIntFlagValue(t *testing.T) {
+	cmd := &Command{
+		Name:  "run",
+		Flags: []Flag{Int("concurrency", "suite workers")},
+	}
+	err := cmd.parse(context.Background(), []string{"--concurrency=abc"})
+	if err == nil || !strings.Contains(err.Error(), "invalid integer value") {
+		t.Fatalf("err=%v, want invalid integer value", err)
+	}
+}
+
+func TestParserRejectsMissingIntFlagValue(t *testing.T) {
+	cmd := &Command{
+		Name:  "run",
+		Flags: []Flag{Int("concurrency", "suite workers")},
+	}
+	err := cmd.parse(context.Background(), []string{"--concurrency"})
+	if err == nil || !strings.Contains(err.Error(), "missing value for flag: concurrency") {
+		t.Fatalf("err=%v, want missing value", err)
+	}
+}
+
 func TestParserRoutesSubcommandBeforeCollectingArgs(t *testing.T) {
 	ran := ""
 	root := &Command{

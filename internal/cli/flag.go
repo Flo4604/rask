@@ -8,6 +8,9 @@ import (
 var (
 	// ErrInvalidBoolValue reports a boolean flag value that cannot be parsed.
 	ErrInvalidBoolValue = fmt.Errorf("invalid boolean value")
+
+	// ErrInvalidIntValue keeps numeric flag failures distinguishable from validation failures.
+	ErrInvalidIntValue = fmt.Errorf("invalid integer value")
 )
 
 // Flag keeps help rendering and parsing independent of concrete flag storage.
@@ -33,7 +36,7 @@ func (b *baseFlag) Usage() string { return b.usage }
 // IsSet reports whether the user explicitly provided this flag.
 func (b *baseFlag) IsSet() bool { return b.set }
 
-// BoolFlag is enough for rask's current CLI, so string/default/env behavior stays out.
+// BoolFlag exists because rask only needs explicit booleans, not a generic flag framework.
 type BoolFlag struct {
 	baseFlag
 	value bool
@@ -58,7 +61,32 @@ func (f *BoolFlag) Parse(value string) error {
 // Value returns the current boolean value.
 func (f *BoolFlag) Value() bool { return f.value }
 
-// Bool creates the only flag shape rask accepts.
+// Bool creates a boolean flag without opening a broader option system.
 func Bool(name string, usage string) *BoolFlag {
 	return &BoolFlag{baseFlag: baseFlag{name: name, usage: usage}}
+}
+
+// IntFlag exists for bounded startup knobs while keeping string flags out.
+type IntFlag struct {
+	baseFlag
+	value int
+}
+
+// Parse records an explicit integer so callers can keep zero as their unset value.
+func (f *IntFlag) Parse(value string) error {
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrInvalidIntValue, value)
+	}
+	f.value = parsed
+	f.set = true
+	return nil
+}
+
+// Value exposes the parsed integer while absent flags still read as zero.
+func (f *IntFlag) Value() int { return f.value }
+
+// Int creates the only numeric flag shape rask accepts.
+func Int(name string, usage string) *IntFlag {
+	return &IntFlag{baseFlag: baseFlag{name: name, usage: usage}}
 }

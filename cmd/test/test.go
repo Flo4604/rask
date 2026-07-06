@@ -67,6 +67,7 @@ type testCommand struct {
 	resultCache    suiteCache
 	patterns       []string
 	noCache        bool
+	concurrency    int
 	frontend       *frontend.Frontend
 	cancelRun      context.CancelFunc
 	cancelCache    context.CancelFunc
@@ -104,6 +105,9 @@ type testArguments struct {
 
 	// noCache reports whether cache reads should be bypassed for this run.
 	noCache bool
+
+	// concurrency fixes suite parallelism when users need deterministic process fan-out.
+	concurrency int
 }
 
 // suiteCache is the cache behavior the test command needs for suites.
@@ -119,7 +123,11 @@ type suiteCache interface {
 // Action parses package patterns and starts the service graph.
 func Action(ctx context.Context, command *cli.Command) error {
 	environment := setup.FromContext(ctx)
-	parsed := testArgumentsFromCommand(command)
+	parsed, err := testArgumentsFromCommand(command)
+	if err != nil {
+		environment.ExitCode = 1
+		return err
+	}
 	cfg, err := appconfig.Load(environment.Stderr)
 	if err != nil {
 		environment.ExitCode = 1
@@ -148,6 +156,7 @@ func Flags() []cli.Flag {
 		cli.Bool("v", "render passing and ignored test lines"),
 		cli.Bool("verbose", "render passing and ignored test lines"),
 		cli.Bool("no-cache", "bypass cache reads and refresh passing suites"),
+		cli.Int("concurrency", "suite workers; 0 or unset uses automatic sizing"),
 	}
 }
 
@@ -183,16 +192,23 @@ func runTest(
 	return command.run()
 }
 
-func testArgumentsFromCommand(command *cli.Command) testArguments {
+func testArgumentsFromCommand(command *cli.Command) (testArguments, error) {
 	parsed := testArguments{
-		patterns: append([]string(nil), command.Args()...),
-		verbose:  command.Bool("v") || command.Bool("verbose"),
-		noCache:  command.Bool("no-cache"),
+		patterns:    append([]string(nil), command.Args()...),
+		verbose:     command.Bool("v") || command.Bool("verbose"),
+		noCache:     command.Bool("no-cache"),
+		concurrency: command.Int("concurrency"),
+	}
+	if parsed.concurrency < 0 {
+		return testArguments{}, fmt.Errorf("--concurrency must be positive")
+	}
+	if parsed.concurrency > run.WorkerCountMax {
+		return testArguments{}, fmt.Errorf("--concurrency must be at most %d", run.WorkerCountMax)
 	}
 	if len(parsed.patterns) == 0 {
 		parsed.patterns = []string{"./..."}
 	}
-	return parsed
+	return parsed, nil
 }
 
 // environmentTool reuses one full go-env read for discovery and fingerprint salting.
@@ -232,15 +248,16 @@ func newTestCommand(
 	ui.ConfigureRun(parsed.verbose, module.Path)
 	return &testCommand{
 		ctx: ctx, tool: tool, module: module, resultCache: resultCache, patterns: parsed.patterns,
-		noCache:    parsed.noCache,
-		frontend:   ui,
-		patternDir: userDir,
-		packages:   make(chan gotool.Package, packageChannelCapacity),
-		suites:     make(chan fingerprint.Suite, suiteChannelCapacity),
-		tasks:      make(chan run.SuiteTask, taskChannelCapacity),
-		results:    make(chan run.Event, resultChannelCapacity),
-		events:     events,
-		startedAt:  time.Now(), errors: make([]error, serviceCount),
+		noCache:     parsed.noCache,
+		concurrency: parsed.concurrency,
+		frontend:    ui,
+		patternDir:  userDir,
+		packages:    make(chan gotool.Package, packageChannelCapacity),
+		suites:      make(chan fingerprint.Suite, suiteChannelCapacity),
+		tasks:       make(chan run.SuiteTask, taskChannelCapacity),
+		results:     make(chan run.Event, resultChannelCapacity),
+		events:      events,
+		startedAt:   time.Now(), errors: make([]error, serviceCount),
 		frontendDone: make(chan struct{}),
 	}
 }
@@ -292,7 +309,7 @@ func (c *testCommand) setup() {
 func (c *testCommand) startServices() {
 	discoverer := discover.New(c.tool, c.module, c.patternDir, c.patterns, c.packages)
 	fingerprinter := fingerprint.New(c.tool, c.module, c.packages, c.suites)
-	runner := run.New(c.tool, c.module.Dir, c.tasks, c.results)
+	runner := run.New(c.tool, c.module.Dir, c.tasks, c.results, c.concurrency)
 	c.startService(serviceDiscover, func() error { return discoverer.Run(c.runCtx) })
 	c.startService(serviceFingerprint, func() error { return fingerprinter.Run(c.runCtx) })
 	c.startService(serviceRunner, func() error { return runner.Run(c.runCtx) })

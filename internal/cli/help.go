@@ -23,6 +23,9 @@ func (c *Command) buildFlagName(flag Flag) string {
 	if _, ok := flag.(*BoolFlag); ok {
 		return prefix + " bool"
 	}
+	if _, ok := flag.(*IntFlag); ok {
+		return prefix + " int"
+	}
 	return prefix
 }
 
