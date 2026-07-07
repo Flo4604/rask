@@ -190,14 +190,20 @@ type suiteState struct {
 }
 
 // Execute folds one suite so callers can choose their own parallelism model.
-func (e *Executor) Execute(ctx context.Context, suite SuiteTask, hooks Hooks) SuiteResult {
-	processCtx, cancelProcess := context.WithCancel(ctx)
-	defer cancelProcess()
+//
+// Kill attribution reads the CALLER's context, never the process context: the
+// watchdog cancels the process context when the child stalls, and if that
+// cancellation were used to classify the kill, a stalled suite would fold as
+// Killed (silently skipped by callers) instead of Failed with a named stall
+// error — hiding exactly the hang the watchdog exists to expose.
+func (e *Executor) Execute(callerCtx context.Context, suite SuiteTask, hooks Hooks) SuiteResult {
+	processCtx, cancel := context.WithCancel(callerCtx)
+	defer cancel()
 	total, totalKnown := e.listSuiteTests(processCtx, suite)
 	state := newSuiteState(suite, total, totalKnown, hooks.Progress)
 	process, err := e.tool.StartTests(processCtx, e.moduleDir, suite.Package.ImportPath)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
+		if errors.Is(callerCtx.Err(), context.Canceled) {
 			return SuiteResult{Package: suite.Package, Digest: suite.Digest, Killed: true}
 		}
 		state.recordError(err)
@@ -207,17 +213,15 @@ func (e *Executor) Execute(ctx context.Context, suite SuiteTask, hooks Hooks) Su
 	if hooks.Started != nil {
 		hooks.Started()
 	}
-	watchdog := startSuiteWatchdog(processCtx, cancelProcess, e.stallAfter)
+	watchdog := startSuiteWatchdog(processCtx, cancel, e.stallAfter)
 	readEvents(process.Events(), state, eventCountPerSuiteMax, watchdog.activity)
 	waitErr := process.Wait()
-	if watchdog.stalled() {
+	watchdog.stop()
+	if watchdog.stalled() && callerCtx.Err() == nil {
 		err := fmt.Errorf("suite produced no output for %s; killed (child process stalled)", e.stallAfter)
 		state.recordError(err)
-		state.failed = true
-		state.killed = true
 	}
-	watchdog.stop()
-	finishSuiteResult(ctx, state, waitErr, process.Stderr())
+	finishSuiteResult(callerCtx, state, waitErr, process.Stderr())
 	return state.result()
 }
 

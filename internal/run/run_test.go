@@ -100,8 +100,10 @@ func TestExecuteWatchdogKillsSilentChild(t *testing.T) {
 	if time.Since(started) > time.Second {
 		t.Fatalf("watchdog took too long to kill stalled suite")
 	}
-	if !result.Failed || !result.Killed || !strings.Contains(result.Err, "suite produced no output for 20ms") {
-		t.Fatalf("result = %+v, want killed stall failure", result)
+	// A stall must surface as a loud failure, never as Killed: callers fold
+	// Killed into "silently skipped", which would hide the hang.
+	if !result.Failed || result.Killed || !strings.Contains(result.Err, "suite produced no output for 20ms") {
+		t.Fatalf("result = %+v, want loud stall failure", result)
 	}
 }
 
