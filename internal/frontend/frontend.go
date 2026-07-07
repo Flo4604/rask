@@ -208,6 +208,10 @@ type TestProgress struct {
 }
 
 // Event is the closed render union consumed by Frontend.Run.
+//
+// Test runs may send events from the orchestrator and suite workers. The
+// orchestrator remains the only close owner so rendering sees one complete
+// stream and never races worker sends against close.
 type Event struct {
 	// Kind selects which payload field is meaningful.
 	Kind EventKind
@@ -366,9 +370,9 @@ func (f *Frontend) RenderRemoved(modulePath string) {
 //
 // Run should be the only goroutine writing terminal output during test runs.
 // Cancellation erases any sticky region and returns ctx.Err; normal completion
-// happens when the single producer closes the event channel after sending
-// EventSummary. Run does not close the channel; orchestration is the single
-// event sender and close owner.
+// happens when orchestration closes the event channel after sending
+// EventSummary. Run does not close the channel; orchestration is the only close
+// owner even though workers may send suite events before the summary.
 func (f *Frontend) Run(ctx context.Context) (int, error) {
 	if f.terminal {
 		return f.runTerminal(ctx)

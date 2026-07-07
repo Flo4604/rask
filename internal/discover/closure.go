@@ -14,7 +14,7 @@ import (
 )
 
 // validateAndMark enforces the package invariants fingerprinting trusts.
-func (d *Discoverer) validateAndMark(
+func (d *discoverer) validateAndMark(
 	closureListing []gotool.Package,
 	selected []gotool.Package,
 ) ([]gotool.Package, error) {

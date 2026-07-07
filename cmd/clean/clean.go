@@ -13,7 +13,7 @@ import (
 // Action removes this module's cache shard or the whole cache store.
 func Action(ctx context.Context, command *cli.Command) error {
 	environment := setup.FromContext(ctx)
-	code, err := run(environment, command)
+	code, err := run(ctx, environment, command)
 	environment.ExitCode = code
 	return err
 }
@@ -29,7 +29,7 @@ func Command() *cli.Command {
 	}
 }
 
-func run(environment *setup.Environment, command *cli.Command) (int, error) {
+func run(ctx context.Context, environment *setup.Environment, command *cli.Command) (int, error) {
 	if len(command.Args()) > 0 {
 		return 1, fmt.Errorf("unknown clean argument %q (did you mean --all?)", command.Args()[0])
 	}
@@ -44,7 +44,7 @@ func run(environment *setup.Environment, command *cli.Command) (int, error) {
 		}
 		return 0, err
 	}
-	module, err := environment.Tool.CurrentModule()
+	module, err := environment.Tool.CurrentModule(ctx)
 	if err != nil {
 		return 1, err
 	}

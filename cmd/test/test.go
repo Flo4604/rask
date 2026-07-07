@@ -2,7 +2,6 @@ package testcmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -22,85 +21,53 @@ import (
 )
 
 const (
-	// packageChannelCapacity bounds discovery-to-fingerprinter buffering.
-	packageChannelCapacity = 64
-
-	// suiteChannelCapacity bounds fingerprinter-to-orchestration buffering.
-	suiteChannelCapacity = 64
-
-	// taskChannelCapacity bounds stale work queued for runner workers.
-	taskChannelCapacity = 64
-
-	// resultChannelCapacity keeps worker results rendezvous-style for fail-fast.
-	resultChannelCapacity = 0
-
-	// eventChannelCapacity bounds orchestration-to-frontend buffering.
+	// eventChannelCapacity preserves the frontend buffer owned by process setup.
 	eventChannelCapacity = setup.EventChannelCapacity
-
-	// cacheLookupSlotCapacity lets one worker publish without depending on
-	// orchestration order, which keeps early exits from stranding goroutines.
-	cacheLookupSlotCapacity = 1
-
-	// cacheLookupWorkerCount collapses I/O-bound remote round trips toward
-	// N/16*RTT without stampeding the shared cache tier.
-	cacheLookupWorkerCount = 16
 )
 
 const (
-	// serviceDiscover identifies the discoverer service error slot.
-	serviceDiscover = iota
+	// outcomeSkipped records a suite that never started after run cancellation.
+	outcomeSkipped suiteOutcomeKind = iota
 
-	// serviceFingerprint identifies the fingerprinter service error slot.
-	serviceFingerprint
+	// outcomeKilled records a suite killed by fail-fast or interruption.
+	outcomeKilled
 
-	// serviceRunner identifies the runner service error slot.
-	serviceRunner
+	// outcomeCached records a suite served from cache without execution.
+	outcomeCached
 
-	// serviceCache identifies the cache lifecycle service error slot.
-	serviceCache
-
-	// serviceFrontend identifies the frontend service error slot.
-	serviceFrontend
-
-	// serviceCount is the number of lifecycle services started by testCommand.
-	serviceCount
+	// outcomeRan records a suite whose runner result contributes test counts.
+	outcomeRan
 )
 
-// testCommand owns the state for one `rask test` run.
+// testCommand owns one linear `rask test` run after process setup.
 type testCommand struct {
-	ctx            context.Context
-	tool           gotool.Tool
-	module         gotool.Module
-	patternDir     string
-	resultCache    suiteCache
-	patterns       []string
-	noCache        bool
-	concurrency    int
-	frontend       *frontend.Frontend
-	cancelRun      context.CancelFunc
-	cancelCache    context.CancelFunc
-	cancelFrontend context.CancelFunc
-	runCtx         context.Context
-	cacheCtx       context.Context
-	frontendCtx    context.Context
-	packages       chan gotool.Package
-	suites         chan fingerprint.Suite
-	tasks          chan run.SuiteTask
-	results        chan run.Event
-	events         chan<- frontend.Event
-	wg             sync.WaitGroup
-	errors         []error
-	frontendDone   chan struct{}
-	frontendCode   int
-	startedAt      time.Time
-	summary        frontend.Summary
-	interrupted    bool
-	tasksClosed    bool
-	resultsOpen    bool
-	failFast       bool
-	staleSent      int
-	staleResults   int
-	staleDropped   int
+	ctx          context.Context
+	tool         gotool.Tool
+	module       gotool.Module
+	patternDir   string
+	resultCache  suiteCache
+	patterns     []string
+	noCache      bool
+	concurrency  int
+	frontend     *frontend.Frontend
+	executor     suiteExecutor
+	events       chan<- frontend.Event
+	frontendDone chan struct{}
+	frontendCode int
+	frontendErr  error
+	startedAt    time.Time
+
+	// runCtx scopes suite work so fail-fast and Ctrl+C are both one cancel.
+	runCtx context.Context
+
+	// cancelRun is safe to call from any worker because cancellation is idempotent.
+	cancelRun context.CancelFunc
+
+	// sem bounds simultaneous cache checks and child `go test` processes.
+	sem chan struct{}
+
+	// wg proves no worker can send events after run closes the channel.
+	wg sync.WaitGroup
 }
 
 // testArguments holds parsed package patterns for the test command.
@@ -123,18 +90,28 @@ type suiteCache interface {
 	Get(ctx context.Context, digest string) (cache.Entry, bool)
 	Put(ctx context.Context, digest string, entry cache.Entry) error
 	Delete(ctx context.Context, digest string)
-	Run(ctx context.Context) error
+	Prune() error
 	HasRemoteTier() bool
 	RemoteStats() cache.RemoteStats
 }
 
-// cacheLookup carries a completed lookup so orchestration remains ordered.
-type cacheLookup struct {
-	entry cache.Entry
-	found bool
+// suiteExecutor is the per-suite seam that keeps orchestration tests deterministic.
+type suiteExecutor interface {
+	Execute(ctx context.Context, task run.SuiteTask, hooks run.Hooks) run.SuiteResult
 }
 
-// Action parses package patterns and starts the service graph.
+// suiteOutcomeKind keeps worker result folding explicit after all goroutines exit.
+type suiteOutcomeKind int
+
+// suiteOutcome records exactly one planned suite result slot.
+type suiteOutcome struct {
+	kind             suiteOutcomeKind
+	entry            cache.Entry
+	result           run.SuiteResult
+	cacheWriteFailed bool
+}
+
+// Action parses package patterns and starts the test run.
 func Action(ctx context.Context, command *cli.Command) error {
 	environment := setup.FromContext(ctx)
 	parsed, err := testArgumentsFromCommand(command)
@@ -174,6 +151,7 @@ func Flags() []cli.Flag {
 	}
 }
 
+// runTest resolves process-edge dependencies before orchestration starts.
 func runTest(
 	ctx context.Context,
 	tool gotool.Tool,
@@ -186,11 +164,7 @@ func runTest(
 	if err != nil {
 		return 1, fmt.Errorf("resolving working directory: %w", err)
 	}
-	module, err := tool.CurrentModule()
-	if err != nil {
-		return 1, err
-	}
-	tool, err = environmentTool(tool, module)
+	module, err := tool.CurrentModule(ctx)
 	if err != nil {
 		return 1, err
 	}
@@ -206,6 +180,7 @@ func runTest(
 	return command.run()
 }
 
+// testArgumentsFromCommand rejects unsafe fan-out before any goroutine starts.
 func testArgumentsFromCommand(command *cli.Command) (testArguments, error) {
 	parsed := testArguments{
 		patterns:    append([]string(nil), command.Args()...),
@@ -225,27 +200,7 @@ func testArgumentsFromCommand(command *cli.Command) (testArguments, error) {
 	return parsed, nil
 }
 
-// environmentTool reuses one full go-env read for discovery and fingerprint salting.
-func environmentTool(tool gotool.Tool, module gotool.Module) (gotool.Tool, error) {
-	environment, err := tool.Environment(module.Dir)
-	if err != nil {
-		return nil, err
-	}
-	return envTool{Tool: tool, environment: environment}, nil
-}
-
-// envTool returns cached environment bytes so one run salts from one go-env output.
-type envTool struct {
-	gotool.Tool
-	environment []byte
-}
-
-// Environment returns the cached full go-env output for fingerprint salting.
-func (t envTool) Environment(string) ([]byte, error) {
-	return append([]byte(nil), t.environment...), nil
-}
-
-// newTestCommand wires channels and rendering for one test command.
+// newTestCommand wires command-owned state after config and cache setup.
 func newTestCommand(
 	ctx context.Context,
 	tool gotool.Tool,
@@ -261,384 +216,250 @@ func newTestCommand(
 	assert.NotNil(ui)
 	ui.ConfigureRun(parsed.verbose, module.Path)
 	return &testCommand{
-		ctx: ctx, tool: tool, module: module, resultCache: resultCache, patterns: parsed.patterns,
-		noCache:     parsed.noCache,
-		concurrency: parsed.concurrency,
-		frontend:    ui,
-		patternDir:  userDir,
-		packages:    make(chan gotool.Package, packageChannelCapacity),
-		suites:      make(chan fingerprint.Suite, suiteChannelCapacity),
-		tasks:       make(chan run.SuiteTask, taskChannelCapacity),
-		results:     make(chan run.Event, resultChannelCapacity),
-		events:      events,
-		startedAt:   time.Now(), errors: make([]error, serviceCount),
-		frontendDone: make(chan struct{}),
+		ctx: ctx, tool: tool, module: module, patternDir: userDir,
+		resultCache: resultCache, patterns: parsed.patterns,
+		noCache: parsed.noCache, concurrency: parsed.concurrency,
+		frontend: ui, executor: run.NewExecutor(tool, module.Dir),
+		events: events, frontendDone: make(chan struct{}), startedAt: time.Now(),
 	}
 }
 
-// run executes setup, service startup, orchestration, and final verdict.
+// run keeps cancellation and summary ownership in one goroutine.
 func (c *testCommand) run() (int, error) {
-	c.setup()
-	defer c.cancelRun()
-	defer c.cancelCache()
-	defer c.cancelFrontend()
-	c.startServices()
-	c.orchestrate()
-	c.cancelCache()
-	// Service error slots are owned by their goroutines until the WaitGroup
-	// completes; read them only after this point.
-	c.wg.Wait()
-	// Interruption is a fact of the root context, not of which select branch
-	// observed it first: with a pre-cancelled context a service can return
-	// context.Canceled before collectSuites ever sees Done, and that error
-	// must still read as clean shutdown, not a failure.
-	if c.ctx.Err() != nil {
-		c.interrupted = true
-	}
-	if c.errors[serviceCache] != nil {
-		c.summary.CacheErrors++
-	}
-	if err := serviceFailure(c.errors, c.failFast || c.interrupted); err != nil {
-		close(c.events)
-		<-c.frontendDone
+	packages, err := discover.Packages(c.ctx, c.tool, c.module, c.patternDir, c.patterns)
+	if err != nil && c.ctx.Err() == nil {
 		return 1, err
 	}
-	c.finishSummary()
+	suites, err := c.suites(packages, err)
+	if err != nil {
+		return 1, err
+	}
+	c.startFrontend()
+	c.sendRunPlan(suites)
+	outcomes := c.runSuites(suites)
+	summary := c.foldSummary(suites, outcomes)
+	if err := c.resultCache.Prune(); err != nil {
+		summary.CacheErrors++
+	}
+	c.events <- frontend.Event{Kind: frontend.EventSummary, Summary: summary}
 	close(c.events)
 	<-c.frontendDone
-	return c.finish()
+	return c.finish(summary)
 }
 
-// setup creates the service lifetimes for this command.
-func (c *testCommand) setup() {
-	runCtx, cancelRun := context.WithCancel(c.ctx)
-	cacheCtx, cancelCache := context.WithCancel(c.ctx)
-	frontendCtx, cancelFrontend := context.WithCancel(context.Background())
-	c.runCtx, c.cancelRun = runCtx, cancelRun
-	c.cacheCtx, c.cancelCache = cacheCtx, cancelCache
-	c.frontendCtx, c.cancelFrontend = frontendCtx, cancelFrontend
+// suites applies interruption policy around batch fingerprinting.
+func (c *testCommand) suites(packages []gotool.Package, previous error) ([]fingerprint.Suite, error) {
+	if previous != nil {
+		return nil, nil
+	}
+	suites, err := fingerprint.Suites(c.ctx, c.tool, c.module, packages)
+	if err != nil {
+		if c.ctx.Err() != nil {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return suites, nil
 }
 
-// startServices starts each lifecycle service.
-func (c *testCommand) startServices() {
-	discoverer := discover.New(c.tool, c.module, c.patternDir, c.patterns, c.packages)
-	fingerprinter := fingerprint.New(c.tool, c.module, c.packages, c.suites)
-	runner := run.New(c.tool, c.module.Dir, c.tasks, c.results, c.concurrency)
-	c.startService(serviceDiscover, func() error { return discoverer.Run(c.runCtx) })
-	c.startService(serviceFingerprint, func() error { return fingerprinter.Run(c.runCtx) })
-	c.startService(serviceRunner, func() error { return runner.Run(c.runCtx) })
-	c.startService(serviceCache, func() error { return c.resultCache.Run(c.cacheCtx) })
-	c.startFrontend()
-}
-
-// startFrontend starts rendering outside the producer-service WaitGroup so the
-// summary event sent after wg.Wait still has a consumer.
+// startFrontend starts rendering after planning inputs are known.
 func (c *testCommand) startFrontend() {
 	go func() {
 		defer close(c.frontendDone)
-		code, err := c.frontend.Run(c.frontendCtx)
-		c.frontendCode = code
-		c.errors[serviceFrontend] = err
+		c.frontendCode, c.frontendErr = c.frontend.Run(context.Background())
 	}()
-}
-
-// startService records one service error in its owned index after Run returns.
-func (c *testCommand) startService(index int, run func() error) {
-	assert.GreaterOrEqual(index, 0)
-	assert.Less(index, serviceCount)
-	c.wg.Go(func() {
-		c.errors[index] = run()
-	})
-}
-
-// orchestrate plans all suites before results stream, then dispatches work.
-func (c *testCommand) orchestrate() {
-	c.resultsOpen = true
-	suites := c.collectSuites()
-	c.sendRunPlan(suites)
-	c.dispatchPlannedSuites(suites)
-}
-
-// collectSuites drains fingerprinted suites so permanent row layout is stable.
-func (c *testCommand) collectSuites() []fingerprint.Suite {
-	suites := make([]fingerprint.Suite, 0)
-	done := c.ctx.Done()
-	for {
-		select {
-		case suite, ok := <-c.suites:
-			if !ok {
-				return suites
-			}
-			suites = append(suites, suite)
-		case <-done:
-			c.interrupted = true
-			c.cancelRun()
-			done = nil
-		}
-	}
 }
 
 // sendRunPlan tells the frontend total suites and widest selected import path.
 func (c *testCommand) sendRunPlan(suites []fingerprint.Suite) {
-	c.summary.Suites = len(suites)
 	width := 0
 	for _, suite := range suites {
 		path := frontend.ShortenImportPath(suite.Package.ImportPath, c.module.Path)
 		width = max(width, len([]rune(path)))
 	}
-	c.sendFrontend(frontend.Event{
+	c.events <- frontend.Event{
 		Kind: frontend.EventRunPlan,
 		RunPlan: frontend.RunPlan{
 			Suites:             len(suites),
 			MaxImportPathWidth: width,
 		},
-	})
-}
-
-// dispatchPlannedSuites partitions planned suites and drains runner results.
-func (c *testCommand) dispatchPlannedSuites(suites []fingerprint.Suite) {
-	slots := c.startCacheLookupPrefetch(suites)
-	for index, suite := range suites {
-		lookup := cacheLookup{}
-		if slots != nil {
-			lookup = <-slots[index]
-		}
-		c.processSuite(suite, lookup)
-	}
-	c.closeTasks()
-	for c.resultsOpen {
-		result, ok := <-c.results
-		c.resultsOpen = c.handleRunnerReceive(ok, result)
 	}
 }
 
-// handleRunnerReceive processes one runner event or records runner completion.
-func (c *testCommand) handleRunnerReceive(ok bool, event run.Event) bool {
+// runSuites fans out one goroutine per suite while the semaphore bounds processes.
+func (c *testCommand) runSuites(suites []fingerprint.Suite) []suiteOutcome {
+	c.runCtx, c.cancelRun = context.WithCancel(c.ctx)
+	defer c.cancelRun()
+	// The semaphore capacity comes from --concurrency so user input directly
+	// bounds simultaneous cache checks and child `go test` processes.
+	c.sem = make(chan struct{}, c.workerCount())
+	outcomes := make([]suiteOutcome, len(suites))
+	for index := range suites {
+		c.wg.Add(1)
+		go c.runSuiteWorker(suites[index], &outcomes[index])
+	}
+	c.wg.Wait()
+	return outcomes
+}
+
+// workerCount resolves the automatic fan-out sentinel once per run.
+func (c *testCommand) workerCount() int {
+	if c.concurrency != 0 {
+		return c.concurrency
+	}
+	return run.DefaultWorkerCount()
+}
+
+// runSuiteWorker writes only its assigned outcome slot, so no result lock is needed.
+func (c *testCommand) runSuiteWorker(suite fingerprint.Suite, outcome *suiteOutcome) {
+	defer c.wg.Done()
+	c.sem <- struct{}{}
+	defer func() { <-c.sem }()
+	if c.runCtx.Err() != nil {
+		*outcome = suiteOutcome{kind: outcomeSkipped}
+		return
+	}
+	if c.tryCacheHit(suite, outcome) {
+		return
+	}
+	result := c.executeSuite(suite)
+	if result.Killed {
+		*outcome = suiteOutcome{kind: outcomeKilled, result: result}
+		return
+	}
+	// Worker sends are plain sends because the frontend drains until close, and
+	// the orchestrator closes events only after wg.Wait proves no senders remain.
+	c.events <- frontend.Event{Kind: frontend.EventSuiteResult, SuiteResult: frontendSuiteResult(result)}
+	*outcome = c.recordRunOutcome(result)
+}
+
+// tryCacheHit sends cache-hit output from the worker that observed the hit.
+func (c *testCommand) tryCacheHit(suite fingerprint.Suite, outcome *suiteOutcome) bool {
+	if c.noCache {
+		return false
+	}
+	entry, ok := c.resultCache.Get(c.runCtx, suite.Digest)
 	if !ok {
 		return false
 	}
-	c.handleRunnerEvent(event)
-	return true
-}
-
-// processSuite partitions one suite through cache and runner policy.
-func (c *testCommand) processSuite(suite fingerprint.Suite, lookup cacheLookup) {
-	if lookup.found {
-		c.summary.Cached++
-		c.summary.Passed += lookup.entry.Passed
-		c.summary.Ignored += lookup.entry.Ignored
-		c.sendCached(suite, lookup.entry)
-		return
-	}
-	if c.failFast || c.tasksClosed {
-		c.staleDropped++
-		return
-	}
-	if !c.sendTask(run.SuiteTask{Package: suite.Package, Digest: suite.Digest}) {
-		c.staleDropped++
-		return
-	}
-	c.staleSent++
-}
-
-// startCacheLookupPrefetch starts bounded remote I/O after planning is fixed.
-func (c *testCommand) startCacheLookupPrefetch(suites []fingerprint.Suite) []chan cacheLookup {
-	if c.noCache {
-		return nil
-	}
-	slots := make([]chan cacheLookup, len(suites))
-	indexes := make(chan int, len(suites))
-	for index := range suites {
-		slots[index] = make(chan cacheLookup, cacheLookupSlotCapacity)
-		indexes <- index
-	}
-	close(indexes)
-	workers := min(cacheLookupWorkerCount, len(suites))
-	for range workers {
-		go c.runCacheLookupWorker(suites, indexes, slots)
-	}
-	return slots
-}
-
-// runCacheLookupWorker owns cache reads while orchestration owns counters.
-func (c *testCommand) runCacheLookupWorker(
-	suites []fingerprint.Suite,
-	indexes <-chan int,
-	slots []chan cacheLookup,
-) {
-	for index := range indexes {
-		lookup := cacheLookup{}
-		if c.runCtx.Err() == nil {
-			entry, found := c.resultCache.Get(c.runCtx, suites[index].Digest)
-			lookup = cacheLookup{entry: entry, found: found}
-		}
-		slots[index] <- lookup
-	}
-}
-
-// handleRunnerEvent forwards runner notifications and applies fail-fast.
-func (c *testCommand) handleRunnerEvent(event run.Event) {
-	switch event.Kind {
-	case run.EventSuiteStarted:
-		c.sendFrontend(frontend.Event{
-			Kind: frontend.EventStarted, ImportPath: event.Suite.Package.ImportPath,
-		})
-		return
-	case run.EventSuiteProgress:
-		c.sendFrontend(frontend.Event{
-			Kind: frontend.EventTestProgress,
-			TestProgress: frontend.TestProgress{
-				ImportPath: event.Progress.Package.ImportPath,
-				Completed:  event.Progress.Completed,
-				Total:      event.Progress.Total,
-				TotalKnown: event.Progress.TotalKnown,
-			},
-		})
-		return
-	case run.EventSuiteResult:
-	default:
-		assert.Unreachable("runner event kind %d", event.Kind)
-	}
-	result := event.Result
-	c.staleResults++
-	c.recordSuiteResult(result)
-	if !result.Killed {
-		c.sendFrontend(frontend.Event{Kind: frontend.EventSuiteResult, SuiteResult: frontendSuiteResult(result)})
-	}
-	if result.Failed && !c.failFast {
-		c.failFast = true
-		c.cancelRun()
-		c.closeTasks()
-	}
-}
-
-// sendCached forwards one cache-hit suite event to the frontend.
-func (c *testCommand) sendCached(suite fingerprint.Suite, entry cache.Entry) {
-	event := frontend.Event{Kind: frontend.EventCached, Cached: frontend.CachedEvent{
+	*outcome = suiteOutcome{kind: outcomeCached, entry: entry}
+	c.events <- frontend.Event{Kind: frontend.EventCached, Cached: frontend.CachedEvent{
 		ImportPath: suite.Package.ImportPath,
 		Passed:     entry.Passed,
 		Ignored:    entry.Ignored,
 	}}
-	c.sendFrontend(event)
+	return true
 }
 
-// sendTask sends one runner task unless run cancellation wins.
-//
-// The non-blocking send followed by a nested select is load-bearing: workers
-// may be blocked sending results while the task channel is full, so waiting
-// on the task send alone would deadlock the producer-consumer pair. Draining
-// results between send attempts keeps both sides moving.
-func (c *testCommand) sendTask(task run.SuiteTask) bool {
-	for c.runCtx.Err() == nil && c.resultsOpen {
-		select {
-		case c.tasks <- task:
-			return true
-		default:
-		}
-		select {
-		case result, ok := <-c.results:
-			c.resultsOpen = c.handleRunnerReceive(ok, result)
-		case <-c.runCtx.Done():
-			return false
-		}
-	}
-	return false
+// executeSuite adapts runner hooks into frontend events without buffering.
+func (c *testCommand) executeSuite(suite fingerprint.Suite) run.SuiteResult {
+	task := run.SuiteTask{Package: suite.Package, Digest: suite.Digest}
+	return c.executor.Execute(c.runCtx, task, run.Hooks{
+		Started: func() {
+			c.events <- frontend.Event{Kind: frontend.EventStarted, ImportPath: suite.Package.ImportPath}
+		},
+		Progress: func(progress run.Progress) {
+			c.events <- frontend.Event{
+				Kind: frontend.EventTestProgress,
+				TestProgress: frontend.TestProgress{
+					ImportPath: suite.Package.ImportPath,
+					Completed:  progress.Completed,
+					Total:      progress.Total,
+					TotalKnown: progress.TotalKnown,
+				},
+			}
+		},
+	})
 }
 
-// sendFrontend sends one render event using the frontend lifetime.
-func (c *testCommand) sendFrontend(event frontend.Event) bool {
-	select {
-	case c.events <- event:
-		return true
-	case <-c.frontendCtx.Done():
-		return false
+// recordRunOutcome owns cache side effects for a completed runner result.
+func (c *testCommand) recordRunOutcome(result run.SuiteResult) suiteOutcome {
+	if result.Failed {
+		c.resultCache.Delete(c.ctx, result.Digest)
+		c.cancelRun()
+		return suiteOutcome{kind: outcomeRan, result: result}
+	}
+	entry := cacheEntryFromResult(result)
+	// Cache writes use the root context: fail-fast must not abort writes for
+	// suites that already completed, but Ctrl+C still should.
+	err := c.resultCache.Put(c.ctx, result.Digest, entry)
+	return suiteOutcome{kind: outcomeRan, result: result, cacheWriteFailed: err != nil}
+}
+
+// cacheEntryFromResult stores only the passing summary needed by warm runs.
+func cacheEntryFromResult(result run.SuiteResult) cache.Entry {
+	passed, _, ignored := countRunnerTests(result.Tests)
+	return cache.Entry{
+		ImportPath:     result.Package.ImportPath,
+		Passed:         passed,
+		Ignored:        ignored,
+		ElapsedSeconds: result.ElapsedSeconds,
+		CreatedAt:      time.Now(),
 	}
 }
 
-// closeTasks closes the task channel exactly once by its single producer.
-func (c *testCommand) closeTasks() {
-	if c.tasksClosed {
-		return
+// foldSummary is single-threaded so outcome counters cannot race with workers.
+func (c *testCommand) foldSummary(
+	suites []fingerprint.Suite,
+	outcomes []suiteOutcome,
+) frontend.Summary {
+	summary := frontend.Summary{Suites: len(suites), Elapsed: time.Since(c.startedAt)}
+	for _, outcome := range outcomes {
+		outcome.foldInto(&summary)
 	}
-	close(c.tasks)
-	c.tasksClosed = true
-}
-
-// finishSummary computes dropped-suite counts and sends the final summary.
-func (c *testCommand) finishSummary() {
-	if c.ctx.Err() != nil {
-		c.interrupted = true
-	}
-	c.summary.Skipped += c.staleDropped + c.staleSent - c.staleResults
-	c.summary.Tests = c.summary.Passed + c.summary.Failed + c.summary.Ignored
-	c.summary.Elapsed = time.Since(c.startedAt)
-	c.summary.Interrupted = c.interrupted
-	c.summary.RemoteConfigured = c.resultCache.HasRemoteTier()
+	summary.Tests = summary.Passed + summary.Failed + summary.Ignored
+	summary.Interrupted = c.ctx.Err() != nil
+	summary.RemoteConfigured = c.resultCache.HasRemoteTier()
 	stats := c.resultCache.RemoteStats()
-	c.summary.RemoteCached = stats.Reads
-	c.summary.RemoteReads = stats.Reads
-	c.summary.RemoteWrites = stats.Writes
-	sort.Strings(c.summary.FailedSuites)
-	c.sendFrontend(frontend.Event{Kind: frontend.EventSummary, Summary: c.summary})
+	summary.RemoteCached = stats.Reads
+	summary.RemoteReads = stats.Reads
+	summary.RemoteWrites = stats.Writes
+	sort.Strings(summary.FailedSuites)
+	return summary
 }
 
-// finish returns after all service errors have been written and waited on.
-func (c *testCommand) finish() (int, error) {
-	if err := serviceFailure(c.errors, c.failFast || c.interrupted); err != nil {
-		return 1, err
+// foldInto converts one indexed outcome into user-visible summary counters.
+func (o suiteOutcome) foldInto(summary *frontend.Summary) {
+	switch o.kind {
+	case outcomeSkipped, outcomeKilled:
+		summary.Skipped++
+	case outcomeCached:
+		summary.Cached++
+		summary.Passed += o.entry.Passed
+		summary.Ignored += o.entry.Ignored
+	case outcomeRan:
+		o.foldRun(summary)
+	default:
+		assert.Unreachable("suite outcome kind %d", o.kind)
+	}
+}
+
+// foldRun keeps executed-suite counting beside the outcome that owns the result.
+func (o suiteOutcome) foldRun(summary *frontend.Summary) {
+	passed, failed, ignored := countRunnerTests(o.result.Tests)
+	summary.Passed += passed
+	summary.Failed += failed
+	summary.Ignored += ignored
+	if o.result.Failed {
+		summary.FailedSuites = append(summary.FailedSuites, o.result.Package.ImportPath)
+	}
+	if o.cacheWriteFailed {
+		summary.CacheErrors++
+	}
+}
+
+// finish applies the historical command exit-code priority.
+func (c *testCommand) finish(summary frontend.Summary) (int, error) {
+	if c.frontendErr != nil {
+		return 1, c.frontendErr
 	}
 	if c.frontendCode != 0 {
 		return c.frontendCode, nil
 	}
-	if len(c.summary.FailedSuites) > 0 {
+	if len(summary.FailedSuites) > 0 {
 		return 1, nil
 	}
 	return 0, nil
-}
-
-// serviceFailure returns the first service error that should fail the command.
-func serviceFailure(errorsByService []error, failFast bool) error {
-	for index, err := range errorsByService {
-		if err == nil {
-			continue
-		}
-		if index == serviceCache {
-			continue
-		}
-		if failFast && errors.Is(err, context.Canceled) {
-			continue
-		}
-		return err
-	}
-	return nil
-}
-
-// recordSuiteResult keeps runner effects on the orchestration goroutine.
-//
-// Passing writes use the root context so fail-fast cancellation does not abort
-// a result that had already arrived before the first failure.
-func (c *testCommand) recordSuiteResult(suite run.SuiteResult) {
-	assert.NotNil(c.resultCache)
-	if suite.Killed {
-		c.summary.Skipped++
-		return
-	}
-	passed, failed, ignored := countRunnerTests(suite.Tests)
-	c.summary.Passed += passed
-	c.summary.Failed += failed
-	c.summary.Ignored += ignored
-	if suite.Failed {
-		c.summary.FailedSuites = append(c.summary.FailedSuites, suite.Package.ImportPath)
-		c.resultCache.Delete(c.ctx, suite.Digest)
-		return
-	}
-	entry := cache.Entry{
-		ImportPath: suite.Package.ImportPath, Passed: passed, Ignored: ignored,
-		ElapsedSeconds: suite.ElapsedSeconds, CreatedAt: time.Now(),
-	}
-	if err := c.resultCache.Put(c.ctx, suite.Digest, entry); err != nil {
-		c.summary.CacheErrors++
-	}
 }
 
 // countRunnerTests returns pass, fail, and skip totals for folded runner tests.

@@ -1,6 +1,6 @@
 # Architecture
 
-rask is a small Go test runner with content-addressed suite caching. It mirrors what `go list` and `go test` already do, then wires discovery, fingerprinting, running, caching, and rendering as channel-connected services with explicit lifetimes.
+rask is a small Go test runner with content-addressed suite caching. It mirrors what `go list` and `go test` already do, then keeps the command core linear: discover the package universe, fingerprint suites, plan rendering, run bounded suite workers, fold one summary.
 
 A run is a straight line down, two cache questions, and a frontend at the end.
 
@@ -37,50 +37,40 @@ A run is a straight line down, two cache questions, and a frontend at the end.
                                  exit 0 · 1
 ```
 
-## Services
+## Test flow
 
-`cmd/test` owns orchestration. At the command edge it loads process configuration once, resolves the current module, opens the cache with an explicit disk directory and remote tier, creates five bounded channels, and starts five services:
+`cmd/test` owns orchestration. At the command edge it loads process configuration once, resolves the current module, opens the cache with an explicit disk directory and remote tier, then runs one ordered flow:
 
-1. `discover.Discoverer.Run(ctx)` lists packages and closes the package channel.
-2. `fingerprint.Fingerprinter.Run(ctx)` consumes packages, fingerprints suites, and closes the suite channel.
-3. `run.Runner.Run(ctx)` consumes stale suite tasks, runs a bounded worker pool, and closes the result channel.
-4. `cache.Cache.Run(ctx)` waits for lifecycle cancellation and prunes once.
-5. `frontend.Frontend.Run(ctx)` consumes render events and owns stdout and stderr.
+1. `discover.Packages(ctx, ...)` returns the full package universe in one batch.
+2. `fingerprint.Suites(ctx, ...)` returns selected suites and digests in one batch.
+3. The frontend goroutine starts and receives one run plan before workers start.
+4. One goroutine is launched per suite, with a semaphore bounding active workers.
+5. Each worker checks the cache, executes one stale suite, writes or deletes cache state, and stores one indexed outcome.
+6. After `WaitGroup.Wait`, the command prunes the cache, folds outcomes into the summary, sends `EventSummary`, closes the event channel, and uses the frontend exit code.
 
-Orchestration drains all fingerprints first so row layout is stable. It sends the frontend a run plan, checks cache hits, forwards cached events, sends stale tasks to the runner, consumes runner results, writes passing cache entries, deletes failing entries, cancels on the first failure, sends the final summary, closes the channels it produces, and then reads service errors after the `WaitGroup` completes.
+Discovery and fingerprinting are batch-shaped because digests need the whole local graph. Running is suite-shaped because cache hits, `go test -json`, and cache writes are independent after each digest exists.
 
-## Channels and seam rules
+## Events and cancellation
 
-There is one typed Go channel per message kind: packages, suites, runner tasks, runner results, and frontend events. Every channel has exactly one sender and one logical receiver. Runner workers are the only competing consumers; they share the single task channel so stale suites are divided across the worker pool.
+There is one event channel into `frontend.Frontend.Run`. The orchestrator sends the run plan and summary; suite workers send cached, started, progress, and completed-suite events. The frontend owns stdout and stderr, consumes until the channel closes, and returns the final rendered exit code. The orchestrator is the only close owner and closes the event channel only after every worker has exited, so worker sends cannot race with close.
 
-Channel capacities are named constants in `cmd/test` and `internal/setup`. Package, suite, task, and event channels are bounded. Runner results are unbuffered so a worker cannot start queued work before orchestration sees a failure.
-
-Close ownership follows the single-sender rule. Discoverer closes packages, Fingerprinter closes suites, orchestration closes tasks after planning and dispatch, Runner closes results after workers exit, and orchestration closes events after the final summary. Sends select on the owning context's `Done` channel.
-
-The seam rules are:
-
-1. Every channel has one sender, and that sender closes it when its `Run` method returns, except orchestration-owned task and event channels.
-2. Every send selects on context cancellation.
-3. Service errors are written to per-service slots and read only after the `WaitGroup` completes.
-4. Fail-fast `context.Canceled` is clean shutdown after the first failed suite.
-5. In-flight suites are killed or dropped and counted once as skipped.
-6. Channel capacities are named constants, not inline literals.
+The command creates one run-scoped child context after planning. Fail-fast and Ctrl+C both cancel that run context. A failed suite cancels the run context after deleting its stale cache entry; queued workers that have not started count as skipped, and in-flight executor kills count as skipped. Passing suite cache writes and failing suite deletes use the root context so fail-fast does not abort completed cache side effects, while Ctrl+C still does.
 
 ## Packages
 
 | Package | Responsibility |
 | --- | --- |
 | `main.go` | Executable entrypoint that assembles the root CLI command. |
-| `cmd/test` | Root test action, channel setup, orchestration loop, cache policy, exit codes. |
+| `cmd/test` | Root test action, linear orchestration, bounded suite workers, cache policy, exit codes. |
 | `cmd/clean` | Cache-cleaning command. |
 | `internal/cli` | Trimmed command parser, boolean flags, generated help. |
 | `internal/config` | Process-edge config loader for `RASK_CONFIG`, `RASK_CACHE_DIR`, remote-cache env overlays, and `~/.rask.json`. |
 | `internal/setup` | Process-bound command dependencies, signal context, frontend setup. |
 | `internal/gotool` | Go tool boundary, system implementation, `go list` data shapes. |
-| `internal/discover` | Package listing service, pattern selection, load-error checks. |
-| `internal/fingerprint` | Package stream consumer, build graph ordering, suite digest computation. |
+| `internal/discover` | Batch package listing, pattern selection, load-error checks. |
+| `internal/fingerprint` | Batch build graph ordering and suite digest computation. |
 | `internal/cache` | Disk cache store, optional remote tier wiring, entry validation, prune policy. |
-| `internal/run` | Suite-task service, worker pool, `go test -json` stream folding. |
+| `internal/run` | Single-suite execution, progress hooks, `go test -json` stream folding. |
 | `internal/s3` | Minimal stdlib-only SigV4 S3 client for cache `Get`, `Put`, and `Delete`; not a general SDK. |
 | `internal/frontend` | Event consumer, suite blocks, sticky TTY progress region, final summary. |
 | `internal/assert` | Always-on assertions for programmer errors. |

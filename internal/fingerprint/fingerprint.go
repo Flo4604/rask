@@ -1,18 +1,17 @@
 // Package fingerprint computes content digests for test suites.
 //
-// Fingerprinting uses two phases. First, package build digests are computed in
-// topological order over build imports. Second, selected test suites become
-// terminal digests over their test files, their package build digest, and
-// discovered local test-only imports.
+// Fingerprinting is batch-shaped because suite digests need the whole local
+// package graph before any cache key can be trusted. First, package build
+// digests are computed in topological order over build imports. Second,
+// selected test suites become terminal digests over their test files, their
+// package build digest, and discovered local test-only imports.
 //
 // Only build imports are topological edges. External test packages may import a
 // package that imports the tested package back, so test imports are deliberately
 // excluded from the graph and added only while hashing suite sinks.
 //
-// [Fingerprinter.Run] is a lifecycle wrapper over the deterministic hashing
-// operation. It starts no internal goroutines; concurrent runs are safe when
-// each run has its own channels and the supplied [gotool.Tool] and filesystem
-// are stable.
+// The package owns no goroutines or channels. Callers discover packages first,
+// then pass the complete universe to [Suites].
 package fingerprint
 
 import (
@@ -54,51 +53,26 @@ type Suite struct {
 	Digest string
 }
 
-// Fingerprinter consumes packages and streams cacheable suite digests.
-//
-// Fingerprinter is safe to run once. Run owns the suite channel: it closes it
-// before returning, consumes packages until the input closes or ctx is
-// cancelled, then computes build digests in dependency order and emits selected
-// testable suites.
-type Fingerprinter struct {
-	tool   gotool.Tool
-	module gotool.Module
-	in     <-chan gotool.Package
-	out    chan<- Suite
-	rand   *rand.Rand
-}
-
-// New returns a fingerprinter connected to package and suite channels.
-func New(
+// Suites fingerprints the package universe into cache-keyed suites.
+func Suites(
+	ctx context.Context,
 	tool gotool.Tool,
 	module gotool.Module,
-	in <-chan gotool.Package,
-	out chan<- Suite,
-) *Fingerprinter {
-	return newWithRand(tool, module, in, out, randomRand())
+	packages []gotool.Package,
+) ([]Suite, error) {
+	return fingerprintWithRand(ctx, tool, module, packages, randomRand())
 }
 
-// newWithRand returns a fingerprinter using rand for ready-queue tie-breaks.
-func newWithRand(
-	tool gotool.Tool,
-	module gotool.Module,
-	in <-chan gotool.Package,
-	out chan<- Suite,
-	rng *rand.Rand,
-) *Fingerprinter {
-	assert.NotNil(rng, "fingerprinting needs a random source")
-	return &Fingerprinter{tool: tool, module: module, in: in, out: out, rand: rng}
-}
-
-// fingerprintWithRand returns suite digests ordered by randomized topological build order.
+// fingerprintWithRand preserves reproducible ready-queue draws for graph tests.
 func fingerprintWithRand(
+	ctx context.Context,
 	tool gotool.Tool,
 	module gotool.Module,
 	packages []gotool.Package,
 	rng *rand.Rand,
 ) ([]Suite, error) {
 	assert.NotNil(rng, "fingerprinting needs a random source")
-	salt, err := hashSalt(tool, module)
+	salt, err := hashSalt(ctx, tool, module)
 	if err != nil {
 		return nil, err
 	}
@@ -120,47 +94,6 @@ func fingerprintWithRand(
 		suites = append(suites, Suite{Package: p, Digest: digest})
 	}
 	return suites, nil
-}
-
-// Run consumes packages, fingerprints suites, emits them, and closes the suite channel.
-//
-// Run is the suite channel's only sender and closes it with defer before
-// returning. Every send selects on ctx.Done so cancellation can unblock
-// downstream backpressure without panicking or leaking a goroutine.
-func (f *Fingerprinter) Run(ctx context.Context) error {
-	defer close(f.out)
-	packages, err := f.collect(ctx)
-	if err != nil {
-		return err
-	}
-	suites, err := fingerprintWithRand(f.tool, f.module, packages, f.rand)
-	if err != nil {
-		return err
-	}
-	for _, suite := range suites {
-		select {
-		case f.out <- suite:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return nil
-}
-
-// collect drains input until close so unresolved imports can be checked at stream end.
-func (f *Fingerprinter) collect(ctx context.Context) ([]gotool.Package, error) {
-	packages := make([]gotool.Package, 0, 256)
-	for {
-		select {
-		case p, ok := <-f.in:
-			if !ok {
-				return packages, nil
-			}
-			packages = append(packages, p)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
 }
 
 // buildDigestMap computes build digests in dependency order.
@@ -260,13 +193,13 @@ func packageMap(packages []gotool.Package) map[string]gotool.Package {
 	return byPath
 }
 
-// hashSalt hashes inputs that should invalidate every suite in the run.
-func hashSalt(tool gotool.Tool, module gotool.Module) (string, error) {
-	environment, err := tool.Environment(module.Dir)
+// hashSalt front-loads global inputs so every suite shares one invalidation root.
+func hashSalt(ctx context.Context, tool gotool.Tool, module gotool.Module) (string, error) {
+	environment, err := tool.Environment(ctx, module.Dir)
 	if err != nil {
 		return "", err
 	}
-	roots, err := discover.LocalModuleRootsFromEnvironment(tool, module, environment)
+	roots, err := discover.LocalModuleRootsFromEnvironment(ctx, tool, module, environment)
 	if err != nil {
 		return "", err
 	}

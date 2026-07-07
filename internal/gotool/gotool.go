@@ -139,17 +139,17 @@ func MatchesListTestsPattern(name string) bool {
 // stale suites execute concurrently. [StartTests] must return a process whose
 // stdout can be drained through [TestProcess.Events].
 type Tool interface {
-	// CurrentModule returns the module that should scope the current rask run.
-	CurrentModule() (Module, error)
+	// CurrentModule accepts ctx so discovery startup can abort a blocked Go command.
+	CurrentModule(ctx context.Context) (Module, error)
 
-	// ListPackages returns `go list` package metadata for patterns in dir.
-	ListPackages(dir string, patterns []string) ([]Package, error)
+	// ListPackages accepts ctx because package discovery is often cancelled by Ctrl+C.
+	ListPackages(ctx context.Context, dir string, patterns []string) ([]Package, error)
 
-	// ListModules returns module metadata visible from dir.
-	ListModules(dir string) ([]Module, error)
+	// ListModules accepts ctx so workspace discovery does not outlive the run.
+	ListModules(ctx context.Context, dir string) ([]Module, error)
 
-	// Environment returns Go environment bytes that affect test binary compatibility.
-	Environment(moduleDir string) ([]byte, error)
+	// Environment accepts ctx so cache salting cannot keep rask alive after cancellation.
+	Environment(ctx context.Context, moduleDir string) ([]byte, error)
 
 	// ListTests returns test names from `go test -list '^Test'` for importPath.
 	ListTests(ctx context.Context, moduleDir string, importPath string) ([]string, error)
@@ -180,9 +180,12 @@ type SystemTool struct{}
 //
 // Workspaces may cause `go list -m -json` to emit more than one module. The
 // deepest module directory containing the current directory wins.
-func (SystemTool) CurrentModule() (Module, error) {
-	output, _, err := runGo("", "list", "-m", "-json")
+func (SystemTool) CurrentModule(ctx context.Context) (Module, error) {
+	output, _, err := runGo(ctx, "", "list", "-m", "-json")
 	if err != nil {
+		if ctx.Err() != nil {
+			return Module{}, ctx.Err()
+		}
 		return Module{}, errors.New("not inside a Go module (go list -m failed)")
 	}
 	cwd, err := os.Getwd()
@@ -197,31 +200,40 @@ func (SystemTool) CurrentModule() (Module, error) {
 // The method rejects non-zero `go list` exits and parses successful JSON
 // streams. Syntax and load errors carried in the JSON Error field are handled
 // by discovery because `go list` may still exit zero for those packages.
-func (SystemTool) ListPackages(dir string, patterns []string) ([]Package, error) {
+func (SystemTool) ListPackages(ctx context.Context, dir string, patterns []string) ([]Package, error) {
 	assert.NotZero(dir)
 	assert.NotZero(len(patterns))
 	arguments := append([]string{"list", "-json=" + listFields}, patterns...)
-	output, stderr, err := runGo(dir, arguments...)
+	output, stderr, err := runGo(ctx, dir, arguments...)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("go list failed: %s", stderr)
 	}
 	return decodePackages(output)
 }
 
 // ListModules returns module metadata visible from dir.
-func (SystemTool) ListModules(dir string) ([]Module, error) {
+func (SystemTool) ListModules(ctx context.Context, dir string) ([]Module, error) {
 	assert.NotZero(dir)
-	output, stderr, err := runGo(dir, "list", "-m", "-json")
+	output, stderr, err := runGo(ctx, dir, "list", "-m", "-json")
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("go list -m failed: %s", stderr)
 	}
 	return decodeModules(output)
 }
 
 // Environment returns full Go environment output for discovery and cache salting.
-func (SystemTool) Environment(moduleDir string) ([]byte, error) {
-	output, _, err := runGo(moduleDir, "env")
+func (SystemTool) Environment(ctx context.Context, moduleDir string) ([]byte, error) {
+	output, _, err := runGo(ctx, moduleDir, "env")
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("go env failed: %w", err)
 	}
 	if len(output) == 0 {
@@ -298,9 +310,10 @@ func isGoTestSummaryLine(line string) bool {
 // Stderr comes back separately because each caller folds the Go command's
 // diagnostic into its own domain-specific error message. An empty dir runs in
 // the current working directory.
-func runGo(dir string, arguments ...string) ([]byte, string, error) {
+func runGo(ctx context.Context, dir string, arguments ...string) ([]byte, string, error) {
+	assert.NotNil(ctx)
 	assert.NotZero(len(arguments))
-	command := exec.Command("go", arguments...)
+	command := exec.CommandContext(ctx, "go", arguments...)
 	command.Dir = dir
 	var stderr bytes.Buffer
 	command.Stderr = &stderr

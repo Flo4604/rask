@@ -2,13 +2,12 @@ package fingerprint
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/chronark/rask/internal/gotool"
 )
@@ -135,36 +134,6 @@ func TestFingerprintStableAcrossGOGCCFLAGSOnlyChanges(t *testing.T) {
 	}
 }
 
-// TestFingerprinterBlockedSendUnblocksOnCancel protects ctx-guarded output sends.
-func TestFingerprinterBlockedSendUnblocksOnCancel(t *testing.T) {
-	module, packages := fingerprintFixture(t)
-	in := make(chan gotool.Package, len(packages))
-	out := make(chan Suite)
-	service := New(&fakeTool{}, module, in, out)
-	for _, p := range packages {
-		in <- p
-	}
-	close(in)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- service.Run(ctx)
-	}()
-	time.Sleep(10 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("err = %v, want context.Canceled", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("fingerprinter stayed blocked on send after cancellation")
-	}
-	if _, ok := <-out; ok {
-		t.Fatalf("fingerprinter must close output channel on return")
-	}
-}
-
 // TestFingerprintWithRandPermutesReadySuites protects inter-suite order draws.
 func TestFingerprintWithRandPermutesReadySuites(t *testing.T) {
 	module, packages := fingerprintFixture(t)
@@ -183,6 +152,33 @@ func TestFingerprintReadyQueueShufflePreservesDependencies(t *testing.T) {
 		if err := dependencyOrderError(packages, order); err != nil {
 			t.Fatalf("seed %d order %v: %v", seed, order, err)
 		}
+	}
+}
+
+// TestSuitesRejectsUnresolvedBuildGraph protects stream-end graph validation.
+func TestSuitesRejectsUnresolvedBuildGraph(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	left := packageFixture(module, "left")
+	right := packageFixture(module, "right")
+	left.Imports = []string{right.ImportPath}
+	right.Imports = []string{left.ImportPath}
+	writeFile(t, left.Dir, "left.go", "package left\n")
+	writeFile(t, left.Dir, "left_test.go", "package left\n")
+	writeFile(t, right.Dir, "right.go", "package right\n")
+	writeFile(t, right.Dir, "right_test.go", "package right\n")
+	_, err := Suites(context.Background(), &fakeTool{}, module, []gotool.Package{left, right})
+	if err == nil || err.Error() != "unresolved discovered imports prevented fingerprinting" {
+		t.Fatalf("err = %v, want unresolved graph error", err)
+	}
+}
+
+// TestSuitesReturnsHashingErrors protects direct propagation from file hashing.
+func TestSuitesReturnsHashingErrors(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	broken := packageFixture(module, "broken")
+	_, err := Suites(context.Background(), &fakeTool{}, module, []gotool.Package{broken})
+	if err == nil || !strings.Contains(err.Error(), "hashing") {
+		t.Fatalf("err = %v, want hashing error", err)
 	}
 }
 
@@ -286,7 +282,13 @@ func fingerprintsWithToolForTest(
 	packages []gotool.Package,
 ) map[string]string {
 	t.Helper()
-	suites, err := fingerprintWithRand(tool, module, packages, rand.New(rand.NewPCG(1, 2)))
+	suites, err := fingerprintWithRand(
+		context.Background(),
+		tool,
+		module,
+		packages,
+		rand.New(rand.NewPCG(1, 2)),
+	)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -305,7 +307,7 @@ func fingerprintOrderForTest(
 	rand *rand.Rand,
 ) []string {
 	t.Helper()
-	suites, err := fingerprintWithRand(&fakeTool{}, module, packages, rand)
+	suites, err := fingerprintWithRand(context.Background(), &fakeTool{}, module, packages, rand)
 	if err != nil {
 		t.Fatalf("fingerprint: %v", err)
 	}
@@ -339,22 +341,22 @@ type fakeTool struct {
 }
 
 // CurrentModule fails because fingerprint tests pass modules directly.
-func (f *fakeTool) CurrentModule() (gotool.Module, error) {
+func (f *fakeTool) CurrentModule(context.Context) (gotool.Module, error) {
 	return gotool.Module{}, fmt.Errorf("unexpected CurrentModule call")
 }
 
 // ListPackages fails because fingerprint tests pass packages directly.
-func (f *fakeTool) ListPackages(string, []string) ([]gotool.Package, error) {
+func (f *fakeTool) ListPackages(context.Context, string, []string) ([]gotool.Package, error) {
 	return nil, fmt.Errorf("unexpected ListPackages call")
 }
 
 // ListModules returns configured workspace modules for fingerprint salt tests.
-func (f *fakeTool) ListModules(string) ([]gotool.Module, error) {
+func (f *fakeTool) ListModules(context.Context, string) ([]gotool.Module, error) {
 	return f.modules, nil
 }
 
 // Environment returns configured or default Go environment bytes.
-func (f *fakeTool) Environment(string) ([]byte, error) {
+func (f *fakeTool) Environment(context.Context, string) ([]byte, error) {
 	if f.environment != nil {
 		return f.environment, nil
 	}

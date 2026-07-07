@@ -82,4 +82,4 @@ Testing 12/74 suites | 41 tests: 40 passed; 0 failed; 1 ignored | 8.3s
 
 The header shows completed suites, total selected suites, folded test counts, and elapsed time. Running rows are sorted longest-running first. Each row shows per-suite progress as `(completed/total)` when the preflight `go test -list '^Test'` succeeds, or `(completed/?)` when that cosmetic listing fails. The region is capped at 32 rows including the overflow row.
 
-`NO_COLOR=1` disables colors and the sticky progress region. See [CLI reference](cli.md) for the full environment table and [Architecture](architecture.md) for the rendering service design.
+`NO_COLOR=1` disables colors and the sticky progress region. See [CLI reference](cli.md) for the full environment table and [Architecture](architecture.md) for the event stream design.

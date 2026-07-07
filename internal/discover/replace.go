@@ -10,7 +10,7 @@ import (
 	"github.com/chronark/rask/internal/assert"
 )
 
-// LocalReplaceRoots returns local filesystem targets from root's go.mod.
+// LocalReplaceRoots avoids x/mod so discovery keeps its zero-dependency contract.
 func LocalReplaceRoots(root string) ([]string, error) {
 	body, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {

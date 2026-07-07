@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,17 +11,22 @@ import (
 	"github.com/chronark/rask/internal/gotool"
 )
 
-// LocalModuleRoots returns sorted local roots that affect fingerprint salts.
-func LocalModuleRoots(tool gotool.Tool, module gotool.Module) ([]string, error) {
-	environment, err := tool.Environment(module.Dir)
+// LocalModuleRoots uses go env once so workspace state matches this run.
+func LocalModuleRoots(
+	ctx context.Context,
+	tool gotool.Tool,
+	module gotool.Module,
+) ([]string, error) {
+	environment, err := tool.Environment(ctx, module.Dir)
 	if err != nil {
 		return nil, err
 	}
-	return LocalModuleRootsFromEnvironment(tool, module, environment)
+	return LocalModuleRootsFromEnvironment(ctx, tool, module, environment)
 }
 
-// LocalModuleRootsFromEnvironment reuses cached go-env bytes from callers.
+// LocalModuleRootsFromEnvironment avoids a second go env for cache salting.
 func LocalModuleRootsFromEnvironment(
+	ctx context.Context,
 	tool gotool.Tool,
 	module gotool.Module,
 	environment []byte,
@@ -30,14 +36,14 @@ func LocalModuleRootsFromEnvironment(
 		return nil, err
 	}
 	if GoWorkPath(environment) != "" {
-		if err := addWorkspaceRoots(tool, module.Dir, roots); err != nil {
+		if err := addWorkspaceRoots(ctx, tool, module.Dir, roots); err != nil {
 			return nil, err
 		}
 	}
 	return addReplaceRoots(roots)
 }
 
-// rootSet bounds transitive replace walks by canonical module directory.
+// rootSet bounds replace walks so cyclic local modules terminate.
 type rootSet struct {
 	// seen prevents cycles from adding the same filesystem module twice.
 	seen map[string]bool
@@ -45,12 +51,12 @@ type rootSet struct {
 	roots []string
 }
 
-// newRootSet creates the mutable root accumulator for one discovery pass.
+// newRootSet centralizes allocation so callers cannot desync seen and roots.
 func newRootSet() *rootSet {
 	return &rootSet{seen: make(map[string]bool)}
 }
 
-// add validates and records one canonical Go module root.
+// add validates roots before they reach go-list or hashing.
 func (s *rootSet) add(dir string) error {
 	root, err := canonicalPath(dir)
 	if err != nil {
@@ -67,16 +73,21 @@ func (s *rootSet) add(dir string) error {
 	return nil
 }
 
-// sorted returns roots in deterministic order for hashing and listing.
+// sorted removes discovery-order noise from later package ordering.
 func (s *rootSet) sorted() []string {
 	roots := append([]string(nil), s.roots...)
 	sort.Strings(roots)
 	return roots
 }
 
-// addWorkspaceRoots includes every active go.work module root.
-func addWorkspaceRoots(tool gotool.Tool, moduleDir string, roots *rootSet) error {
-	modules, err := tool.ListModules(moduleDir)
+// addWorkspaceRoots keeps go.work siblings in the same local-root universe.
+func addWorkspaceRoots(
+	ctx context.Context,
+	tool gotool.Tool,
+	moduleDir string,
+	roots *rootSet,
+) error {
+	modules, err := tool.ListModules(ctx, moduleDir)
 	if err != nil {
 		return fmt.Errorf("enumerating workspace modules from %s: %w", moduleDir, err)
 	}
@@ -91,7 +102,7 @@ func addWorkspaceRoots(tool gotool.Tool, moduleDir string, roots *rootSet) error
 	return nil
 }
 
-// addReplaceRoots follows local filesystem replaces until the set stops growing.
+// addReplaceRoots follows transitive local replaces before sorting the set.
 func addReplaceRoots(roots *rootSet) ([]string, error) {
 	for index := 0; index < len(roots.roots); index++ {
 		replacements, err := LocalReplaceRoots(roots.roots[index])
@@ -107,7 +118,7 @@ func addReplaceRoots(roots *rootSet) ([]string, error) {
 	return roots.sorted(), nil
 }
 
-// validateModuleRoot protects later go-list and hashing assumptions.
+// validateModuleRoot fails near the bad root instead of deep in discovery.
 func validateModuleRoot(root string) error {
 	info, err := os.Stat(root)
 	if err != nil {
@@ -122,7 +133,7 @@ func validateModuleRoot(root string) error {
 	return nil
 }
 
-// canonicalPath normalizes filesystem roots before equality checks.
+// canonicalPath gives equality checks a single absolute path spelling.
 func canonicalPath(dir string) (string, error) {
 	root, err := filepath.Abs(dir)
 	if err != nil {
@@ -133,7 +144,7 @@ func canonicalPath(dir string) (string, error) {
 	return root, nil
 }
 
-// additionalRoots filters the main module from the sorted local-root list.
+// additionalRoots prevents the main module from being listed twice.
 func additionalRoots(roots []string, mainRoot string) []string {
 	mainRoot, err := canonicalPath(mainRoot)
 	if err != nil {

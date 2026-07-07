@@ -2,6 +2,7 @@ package gotool
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -80,6 +81,16 @@ func TestSystemToolListTestsFailureReturnsError(t *testing.T) {
 	_, err := SystemTool{}.ListTests(ctx, dir, "example.com/m/bad")
 	if err == nil || !strings.Contains(err.Error(), "go test -list failed") {
 		t.Fatalf("err = %v, want go test -list failure", err)
+	}
+}
+
+// TestSystemToolListPackagesCanceledReturnsContextError protects discovery aborts.
+func TestSystemToolListPackagesCanceledReturnsContextError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := SystemTool{}.ListPackages(ctx, t.TempDir(), []string{"."})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context canceled", err)
 	}
 }
 

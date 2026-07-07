@@ -4,7 +4,8 @@
 // selected packages, loads the local package closure needed for fingerprinting,
 // and rejects load errors before hashing starts.
 //
-// [Discoverer.Run] is a lifecycle wrapper over the pure discovery operation.
-// It starts no internal goroutines; concurrent use is safe when each run has
-// its own package channel and the supplied [gotool.Tool] implementation is safe.
+// [Packages] returns a finished slice instead of streaming on a channel because
+// `go list` already materializes discovery as a batch. The old stream only
+// replayed a completed slice, which made cancellation and ownership harder to
+// reason about without reducing memory use.
 package discover

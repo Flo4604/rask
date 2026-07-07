@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// GoWorkPath returns the active go.work path from full go-env output.
+// GoWorkPath centralizes GOWORK semantics so root discovery stays deterministic.
 func GoWorkPath(environment []byte) string {
 	value := goEnvValue(environment, "GOWORK")
 	if value == "off" {

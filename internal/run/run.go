@@ -1,15 +1,9 @@
-// Package run executes stale suites and folds `go test -json` streams.
+// Package run executes one suite and folds its `go test -json` stream.
 //
-// The package owns the worker pool, per-suite process execution, JSON event
-// folding, output bounds, and a per-suite no-output watchdog that kills child
-// processes stalled before the test binary can enforce `go test -timeout`. It
-// consumes [gotool.Tool] but does not know about result caching or terminal
-// rendering.
-//
-// [Runner.Run] closes the result channel when all workers stop. Cancellation
-// stops queued work, kills in-flight `go test` processes through the supplied
-// context, and may stop ctx-guarded result emits so orchestration can count
-// unsent stale work as skipped.
+// Callers own suite fan-out. This package keeps only the per-suite work that
+// has to stay beside process execution: test enumeration for progress totals,
+// JSON folding with memory bounds, and the no-output watchdog that kills a
+// child before a compile or lock wait can stall the whole command.
 package run
 
 import (
@@ -21,7 +15,6 @@ import (
 	"io"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,7 +34,7 @@ const (
 	// A production hang showed workers blocked in stdout reads for more than
 	// five minutes while rask itself stayed healthy. `go test -timeout` only
 	// bounds the test binary after it starts, not compile-phase or lock-wait
-	// stalls, so the runner supervises every child process directly.
+	// stalls, so the executor supervises every child process directly.
 	defaultSuiteStallAfter = 5 * time.Minute
 
 	// outputLinesPerTestKept bounds retained diagnostic output per test and package.
@@ -53,6 +46,11 @@ const (
 	// WorkerCountMax caps suite parallelism so user input cannot fan out unbounded processes.
 	WorkerCountMax = 32
 )
+
+// DefaultWorkerCount leaves one CPU for orchestration while bounding process fan-out.
+func DefaultWorkerCount() int {
+	return min(WorkerCountMax, max(1, runtime.GOMAXPROCS(0)-1))
+}
 
 // TestOutcome is the terminal state of one test reported by `go test -json`.
 type TestOutcome string
@@ -112,7 +110,7 @@ type SuiteResult struct {
 	// ElapsedSeconds is the package elapsed time reported by `go test -json`.
 	ElapsedSeconds float64
 
-	// Failed reports whether the suite completed with a failing package result or runner error.
+	// Failed reports whether the package or executor reached a user-visible failure.
 	Failed bool
 
 	// Completed reports whether a package-level pass, fail, or skip event was seen.
@@ -121,146 +119,49 @@ type SuiteResult struct {
 	// Killed reports whether fail-fast cancellation stopped the suite.
 	Killed bool
 
-	// Err is the runner or process error text, or empty when no extra error occurred.
+	// Err is the process or folding error text, or empty when no extra error occurred.
 	Err string
 }
 
-// EventKind identifies the runner event payload carried by Event.
-type EventKind int
-
-const (
-	// EventSuiteStarted reports a suite entering the runner pool.
-	EventSuiteStarted EventKind = iota + 1
-
-	// EventSuiteProgress reports live terminal test counts for a running suite.
-	EventSuiteProgress
-
-	// EventSuiteResult reports one terminal folded suite result.
-	EventSuiteResult
-)
-
-// SuiteProgress carries cosmetic live progress for one running suite.
-type SuiteProgress struct {
-	// Package is the suite package whose row should update.
-	Package gotool.Package
-
-	// Completed counts top-level terminal events so units match the -list total.
+// Progress lets callers render one suite without coupling run to a UI protocol.
+type Progress struct {
+	// Completed counts top-level terminal events so progress units match `go test -list`.
 	Completed int
 
-	// Total is the lister-reported total when TotalKnown is true.
+	// Total carries the lister denominator when enumeration succeeds.
 	Total int
 
-	// TotalKnown reports whether test enumeration succeeded before execution.
+	// TotalKnown lets callers avoid displaying a fake denominator after lister failure.
 	TotalKnown bool
 }
 
-// Event is the runner output stream consumed by orchestration.
-type Event struct {
-	// Kind selects which payload field is meaningful.
-	Kind EventKind
+// Hooks keeps lifecycle side effects caller-owned while Execute stays synchronous.
+type Hooks struct {
+	// Started fires only after a child process exists, so callers can mark real work.
+	Started func()
 
-	// Suite carries the task metadata for EventSuiteStarted.
-	Suite SuiteTask
-
-	// Progress carries live suite counters for EventSuiteProgress.
-	Progress SuiteProgress
-
-	// Result carries the folded terminal result for EventSuiteResult.
-	Result SuiteResult
+	// Progress fires on terminal top-level test events, so callers can update one row.
+	Progress func(Progress)
 }
 
-// Runner consumes stale suite tasks and streams worker results.
-//
-// Runner is safe to run once. The bounded worker pool shares one task channel,
-// so workers compete for tasks instead of duplicating them. Run owns the result
-// channel and closes it after every worker exits.
-type Runner struct {
-	tool      gotool.Tool
-	moduleDir string
-	in        <-chan SuiteTask
-	out       chan<- Event
-	workers   int
+// Executor owns the dependencies for one suite execution.
+type Executor struct {
+	tool       gotool.Tool
+	moduleDir  string
+	stallAfter time.Duration
 }
 
-// New returns a runner connected to task and result channels.
-func New(
-	tool gotool.Tool,
-	moduleDir string,
-	in <-chan SuiteTask,
-	out chan<- Event,
-	workers int,
-) *Runner {
-	return &Runner{tool: tool, moduleDir: moduleDir, in: in, out: out, workers: workers}
+// NewExecutor uses production stall bounds so one silent child cannot hang a run.
+func NewExecutor(tool gotool.Tool, moduleDir string) *Executor {
+	return newExecutor(tool, moduleDir, defaultSuiteStallAfter)
 }
 
-// Run starts the bounded worker pool, consumes tasks, emits results, and closes them.
-//
-// Run is the result channel's only sender and closes it with defer before
-// returning. Every result send selects on ctx.Done so cancellation can unblock
-// orchestration backpressure. Runner never closes the task channel because
-// orchestration is its single sender and close owner.
-func (r *Runner) Run(ctx context.Context) error {
-	defer close(r.out)
-	var wg sync.WaitGroup
-	for range r.workerPoolSize() {
-		wg.Go(func() { r.runWorker(ctx) })
-	}
-	wg.Wait()
-	return nil
+// newExecutor lets tests shrink watchdog time without changing production defaults.
+func newExecutor(tool gotool.Tool, moduleDir string, stallAfter time.Duration) *Executor {
+	return &Executor{tool: tool, moduleDir: moduleDir, stallAfter: stallAfter}
 }
 
-// workerPoolSize preserves the automatic default unless startup fixed the pool.
-//
-// One CPU stays free so orchestration and rendering remain responsive while
-// suites run, and the cap bounds process fan-out on very wide machines.
-func (r *Runner) workerPoolSize() int {
-	if r.workers > 0 {
-		return r.workers
-	}
-	return min(WorkerCountMax, max(1, runtime.GOMAXPROCS(0)-1))
-}
-
-// runWorker consumes tasks until the task subscription closes or ctx cancellation stops the pool.
-func (r *Runner) runWorker(ctx context.Context) {
-	for {
-		suite, ok := r.receiveTask(ctx)
-		if !ok {
-			return
-		}
-		if !r.sendEvent(ctx, Event{Kind: EventSuiteStarted, Suite: suite}) {
-			return
-		}
-		emit := func(progress SuiteProgress) bool {
-			return r.sendEvent(ctx, Event{Kind: EventSuiteProgress, Progress: progress})
-		}
-		result := runSuite(ctx, r.tool, r.moduleDir, suite, defaultSuiteStallAfter, emit)
-		if !r.sendEvent(ctx, Event{Kind: EventSuiteResult, Result: result}) {
-			return
-		}
-	}
-}
-
-// receiveTask waits for one task or cancellation.
-func (r *Runner) receiveTask(ctx context.Context) (SuiteTask, bool) {
-	select {
-	case suite, ok := <-r.in:
-		return suite, ok
-	case <-ctx.Done():
-		return SuiteTask{}, false
-	}
-}
-
-// sendEvent sends one runner event unless ctx cancellation wins first.
-func (r *Runner) sendEvent(ctx context.Context, event Event) bool {
-	select {
-	case r.out <- event:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
-
-// testEvent mirrors the `go test -json` event fields used by the folder.
+// testEvent keeps the decoder narrow so unknown JSON fields cannot affect folding.
 type testEvent struct {
 	Action  string
 	Package string
@@ -285,66 +186,58 @@ type suiteState struct {
 	completed              bool
 	killed                 bool
 	err                    error
-	emitProgress           func(SuiteProgress) bool
+	emitProgress           func(Progress)
 }
 
-// runSuite starts `go test`, drains stdout events, waits, and builds a suite result.
-func runSuite(
-	ctx context.Context,
-	tool gotool.Tool,
-	moduleDir string,
-	suite SuiteTask,
-	stallAfter time.Duration,
-	emitProgress func(SuiteProgress) bool,
-) SuiteResult {
+// Execute folds one suite so callers can choose their own parallelism model.
+func (e *Executor) Execute(ctx context.Context, suite SuiteTask, hooks Hooks) SuiteResult {
 	processCtx, cancelProcess := context.WithCancel(ctx)
 	defer cancelProcess()
-	total, totalKnown := listSuiteTests(processCtx, tool, moduleDir, suite, stallAfter)
-	state := newSuiteState(suite, total, totalKnown, emitProgress)
-	state.reportProgress()
-	process, err := tool.StartTests(processCtx, moduleDir, suite.Package.ImportPath)
+	total, totalKnown := e.listSuiteTests(processCtx, suite)
+	state := newSuiteState(suite, total, totalKnown, hooks.Progress)
+	process, err := e.tool.StartTests(processCtx, e.moduleDir, suite.Package.ImportPath)
 	if err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return SuiteResult{Package: suite.Package, Digest: suite.Digest, Killed: true}
 		}
-		state.err = err
+		state.recordError(err)
 		state.failed = true
 		return state.result()
 	}
-	watchdog := startSuiteWatchdog(processCtx, cancelProcess, stallAfter)
+	if hooks.Started != nil {
+		hooks.Started()
+	}
+	watchdog := startSuiteWatchdog(processCtx, cancelProcess, e.stallAfter)
 	readEvents(process.Events(), state, eventCountPerSuiteMax, watchdog.activity)
 	waitErr := process.Wait()
 	if watchdog.stalled() {
-		state.err = fmt.Errorf("suite produced no output for %s; killed (child process stalled)", stallAfter)
+		err := fmt.Errorf("suite produced no output for %s; killed (child process stalled)", e.stallAfter)
+		state.recordError(err)
+		state.failed = true
+		state.killed = true
 	}
 	watchdog.stop()
 	finishSuiteResult(ctx, state, waitErr, process.Stderr())
 	return state.result()
 }
 
-// listSuiteTests returns a cosmetic test total, falling back to unknown on error.
-func listSuiteTests(
-	ctx context.Context,
-	tool gotool.Tool,
-	moduleDir string,
-	suite SuiteTask,
-	stallAfter time.Duration,
-) (int, bool) {
-	listCtx, cancel := context.WithTimeout(ctx, stallAfter)
+// listSuiteTests keeps progress cosmetic because suite execution must not fail on listing.
+func (e *Executor) listSuiteTests(ctx context.Context, suite SuiteTask) (int, bool) {
+	listCtx, cancel := context.WithTimeout(ctx, e.stallAfter)
 	defer cancel()
-	tests, err := tool.ListTests(listCtx, moduleDir, suite.Package.ImportPath)
+	tests, err := e.tool.ListTests(listCtx, e.moduleDir, suite.Package.ImportPath)
 	if err != nil {
 		return 0, false
 	}
 	return len(tests), true
 }
 
-// newSuiteState initializes event-folding state for a suite with tests.
+// newSuiteState centralizes bounds maps so every suite starts with the same invariants.
 func newSuiteState(
 	suite SuiteTask,
 	totalTests int,
 	totalKnown bool,
-	emitProgress func(SuiteProgress) bool,
+	emitProgress func(Progress),
 ) *suiteState {
 	assert.True(suite.Package.HasTests())
 	return &suiteState{
@@ -370,7 +263,9 @@ func readEvents(stream io.Reader, state *suiteState, eventLimit int, activity fu
 	scanner.Buffer(make([]byte, 64*1024), lineBytesMax)
 	for eventCount := 0; scanner.Scan(); eventCount++ {
 		if eventCount >= eventLimit {
-			state.err = fmt.Errorf("suite %s exceeded %d events", state.suite.Package.ImportPath, eventLimit)
+			state.recordError(
+				fmt.Errorf("suite %s exceeded %d events", state.suite.Package.ImportPath, eventLimit),
+			)
 			break
 		}
 		var ev testEvent
@@ -382,8 +277,8 @@ func readEvents(stream io.Reader, state *suiteState, eventLimit int, activity fu
 			state.reportProgress()
 		}
 	}
-	if scanner.Err() != nil && state.err == nil {
-		state.err = fmt.Errorf("reading %s events: %w", state.suite.Package.ImportPath, scanner.Err())
+	if err := scanner.Err(); err != nil && !errors.Is(err, context.Canceled) && state.err == nil {
+		state.recordError(fmt.Errorf("reading %s events: %w", state.suite.Package.ImportPath, err))
 	}
 	_, _ = io.Copy(io.Discard, &events)
 }
@@ -500,10 +395,10 @@ func finishSuiteResult(ctx context.Context, state *suiteState, waitErr error, st
 		return
 	}
 	if waitErr != nil {
-		state.err = fmt.Errorf("go test: %w", waitErr)
+		state.recordError(fmt.Errorf("go test: %w", waitErr))
 		return
 	}
-	state.err = errors.New("go test exited without a package result")
+	state.recordError(errors.New("go test exited without a package result"))
 }
 
 // applyEvent routes one JSON event and reports whether progress changed.
@@ -569,10 +464,7 @@ func (s *suiteState) reportProgress() {
 	if s.emitProgress == nil {
 		return
 	}
-	s.emitProgress(SuiteProgress{
-		Package: s.suite.Package, Completed: s.completedTopLevelTests,
-		Total: s.totalTests, TotalKnown: s.totalKnown,
-	})
+	s.emitProgress(Progress{Completed: s.completedTopLevelTests, Total: s.totalTests, TotalKnown: s.totalKnown})
 }
 
 // recordTestStarted records a test name once and enforces the per-suite bound.
@@ -582,7 +474,9 @@ func (s *suiteState) recordTestStarted(name string) {
 	}
 	if len(s.testNames) >= testCountPerSuiteMax {
 		if s.err == nil {
-			s.err = fmt.Errorf("suite %s exceeded %d tests", s.suite.Package.ImportPath, testCountPerSuiteMax)
+			s.recordError(
+				fmt.Errorf("suite %s exceeded %d tests", s.suite.Package.ImportPath, testCountPerSuiteMax),
+			)
 		}
 		return
 	}
@@ -605,6 +499,14 @@ func (s *suiteState) recordPackageOutput(line string) {
 		return
 	}
 	s.packageOutput = append(s.packageOutput, line)
+}
+
+// recordError preserves the first failure and makes diagnostics renderable.
+func (s *suiteState) recordError(err error) {
+	if s.err == nil {
+		s.err = err
+	}
+	s.recordPackageOutput(err.Error() + "\n")
 }
 
 // result converts mutable folding state into an immutable suite result.

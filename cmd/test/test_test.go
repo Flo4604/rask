@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,7 +102,7 @@ func TestExecuteReturnsOneForFlagError(t *testing.T) {
 	}
 }
 
-// TestExecuteRejectsNegativeConcurrency protects startup validation before services exist.
+// TestExecuteRejectsNegativeConcurrency protects startup validation before work exists.
 func TestExecuteRejectsNegativeConcurrency(t *testing.T) {
 	code, _, errOut := executeWithTool(t, &fakeTool{}, "--concurrency", "-1")
 	if code != 1 {
@@ -178,116 +177,52 @@ func TestExecuteFingerprinterErrorCleanShutdown(t *testing.T) {
 	}
 }
 
-// TestExecuteFailFastCancelMidStreamCountsOnce protects orchestration cancellation seams.
-func TestExecuteFailFastCancelMidStreamCountsOnce(t *testing.T) {
-	old := runtime.GOMAXPROCS(2)
-	defer runtime.GOMAXPROCS(old)
+// TestFailFastWithOneWorkerSkipsLaterSuites protects fail-fast counting.
+func TestFailFastWithOneWorkerSkipsLaterSuites(t *testing.T) {
 	module := moduleFixtureRoot(t)
-	t.Setenv("RASK_CACHE_DIR", t.TempDir())
-	first := packageFixture(module, "first")
-	second := packageFixture(module, "second")
-	second.Imports = []string{first.ImportPath}
-	writePackageFiles(t, first)
-	writePackageFiles(t, second)
-	tool := &fakeTool{module: module, all: []gotool.Package{first, second}, streams: map[string]string{
-		first.ImportPath:  `{"Action":"run","Test":"TestBad"}` + "\n" + `{"Action":"fail","Test":"TestBad"}` + "\n" + `{"Action":"fail","Elapsed":0.01}` + "\n",
-		second.ImportPath: `{"Action":"pass","Elapsed":0.01}` + "\n",
-	}}
-	code, out, errOut := executeWithTool(t, tool, "test", "./...")
-	if code != 1 {
-		t.Fatalf("code=%d, want code 1", code)
-	}
-	combined := out + errOut
-	if strings.Contains(combined, "context canceled") {
-		t.Fatalf("output leaked context cancellation:\n%s", combined)
-	}
-	if !strings.Contains(combined, "1 suite skipped") {
-		t.Fatalf("output = %q, want one skipped suite", combined)
-	}
-	if tool.started[second.ImportPath] != 0 {
-		t.Fatalf("second suite started %d times, want queued skip", tool.started[second.ImportPath])
+	suites := manySuites(module, 2)
+	executor := &fakeExecutor{results: failingResults(suites)}
+	command := workerCommand(module, &memorySuiteCache{}, executor, make(chan frontend.Event, 8))
+	command.concurrency = 1
+	outcomes := command.runSuites(suites)
+	summary := command.foldSummary(suites, outcomes)
+	if len(summary.FailedSuites) != 1 || summary.Skipped != 1 || executor.totalCalls() != 1 {
+		t.Fatalf("summary=%+v, want one failed and one skipped suite", summary)
 	}
 }
 
-// TestOrchestratorDrainsResultsWhileDispatchingTasks protects task backpressure.
-func TestOrchestratorDrainsResultsWhileDispatchingTasks(t *testing.T) {
-	old := runtime.GOMAXPROCS(2)
-	defer runtime.GOMAXPROCS(old)
+// TestCachedHitCountsAndEmitsEvent protects cached summary and rendering events.
+func TestCachedHitCountsAndEmitsEvent(t *testing.T) {
 	module := moduleFixtureRoot(t)
-	t.Setenv("RASK_CACHE_DIR", t.TempDir())
-	resultCache, err := cache.Open(cache.Config{
-		ModulePath: module.Path,
-		DiskDir:    t.TempDir(),
-		Remote:     nil,
-	})
-	if err != nil {
-		t.Fatalf("open cache: %v", err)
+	suite := manySuites(module, 1)[0]
+	entry := cache.Entry{ImportPath: suite.Package.ImportPath, Passed: 2, Ignored: 1}
+	resultCache := newRecordingSuiteCache(suite.Digest, entry)
+	events := make(chan frontend.Event, eventChannelCapacity)
+	command := workerCommand(module, resultCache, &fakeExecutor{}, events)
+	outcomes := command.runSuites([]fingerprint.Suite{suite})
+	summary := command.foldSummary([]fingerprint.Suite{suite}, outcomes)
+	if summary.Cached != 1 || summary.Passed != 2 || summary.Ignored != 1 {
+		t.Fatalf("summary=%+v, want cached counts", summary)
 	}
-	suites := manySuites(module, 32)
-	tool := &fakeTool{module: module, streams: passingStreams(suites)}
-	tasks := make(chan run.SuiteTask, 1)
-	results := make(chan run.Event, 1)
-	events := make(chan frontend.Event, 1024)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	command := &testCommand{
-		ctx: ctx, runCtx: ctx, frontendCtx: ctx, module: module, tool: tool,
-		resultCache: resultCache, tasks: tasks, results: results, events: events, resultsOpen: true,
-		summary: frontend.Summary{Suites: len(suites)},
-	}
-	runner := run.New(tool, module.Dir, tasks, results, 0)
-	runnerDone := make(chan error, 1)
-	go func() {
-		runnerDone <- runner.Run(ctx)
-	}()
-	done := make(chan struct{}, 1)
-	go func() {
-		dispatchSuites(command, suites)
-		done <- struct{}{}
-	}()
-	waitForDispatch(t, ctx, done)
-	waitForRunner(t, ctx, runnerDone)
-	if command.summary.Suites != len(suites) || command.summary.Passed != len(suites) {
-		t.Fatalf("summary = %+v, want %d suites passed", command.summary, len(suites))
+	if !drainHasCachedEvent(events) {
+		t.Fatalf("cached path emitted no cached event")
 	}
 }
 
 // TestNoCacheBypassesHitsAndRefreshesPasses protects docker-style no-cache semantics.
 func TestNoCacheBypassesHitsAndRefreshesPasses(t *testing.T) {
 	module := moduleFixtureRoot(t)
-	suite := fingerprint.Suite{
-		Package: packageFixture(module, "cached"),
-		Digest:  strings.Repeat("a", 64),
-	}
+	suite := manySuites(module, 1)[0]
 	entry := cache.Entry{ImportPath: suite.Package.ImportPath, Passed: 1, CreatedAt: time.Unix(1, 0)}
 	resultCache := newRecordingSuiteCache(suite.Digest, entry)
+	executor := &fakeExecutor{}
 	events := make(chan frontend.Event, eventChannelCapacity)
-	cached := &testCommand{
-		ctx: context.Background(), runCtx: context.Background(), frontendCtx: context.Background(),
-		resultCache: resultCache, tasks: make(chan run.SuiteTask, 1), events: events,
-		summary: frontend.Summary{Suites: 1},
-	}
-	slots := cached.startCacheLookupPrefetch([]fingerprint.Suite{suite})
-	cached.processSuite(suite, <-slots[0])
-	if resultCache.gets != 1 || cached.summary.Cached != 1 || cached.summary.Passed != 1 {
-		t.Fatalf("cached path gets=%d summary=%+v, want one cached hit", resultCache.gets, cached.summary)
-	}
-	if !drainHasCachedEvent(events) {
-		t.Fatalf("cached path emitted no cached event")
-	}
-
-	resultCache = newRecordingSuiteCache(suite.Digest, entry)
-	events = make(chan frontend.Event, eventChannelCapacity)
-	tool := &fakeTool{module: module, streams: passingStreams([]fingerprint.Suite{suite})}
-	command := noCacheCommandForTest(t, module, tool, resultCache, events)
-	runner := run.New(tool, module.Dir, command.tasks, command.results, 0)
-	runnerDone := make(chan error, 1)
-	go func() { runnerDone <- runner.Run(command.ctx) }()
-	dispatchSuites(command, []fingerprint.Suite{suite})
-	waitForRunner(t, command.ctx, runnerDone)
-	if resultCache.gets != 0 || resultCache.puts != 1 || tool.started[suite.Package.ImportPath] != 1 {
-		t.Fatalf("no-cache gets=%d puts=%d started=%d, want bypass read and refresh",
-			resultCache.gets, resultCache.puts, tool.started[suite.Package.ImportPath])
+	command := workerCommand(module, resultCache, executor, events)
+	command.noCache = true
+	command.runSuites([]fingerprint.Suite{suite})
+	if resultCache.gets != 0 || resultCache.puts != 1 || executor.callsFor(suite.Digest) != 1 {
+		t.Fatalf("gets=%d puts=%d executes=%d, want bypass read and refresh",
+			resultCache.gets, resultCache.puts, executor.callsFor(suite.Digest))
 	}
 	if resultCache.entries[suite.Digest].CreatedAt.Equal(entry.CreatedAt) {
 		t.Fatalf("cache entry was not refreshed: %+v", resultCache.entries[suite.Digest])
@@ -297,27 +232,54 @@ func TestNoCacheBypassesHitsAndRefreshesPasses(t *testing.T) {
 	}
 }
 
-// TestConcurrentCacheLookupsStayOrdered protects bounded prefetch ordering.
-func TestConcurrentCacheLookupsStayOrdered(t *testing.T) {
+// TestWorkerSemaphoreBoundsConcurrentExecutes protects --concurrency fan-out.
+func TestWorkerSemaphoreBoundsConcurrentExecutes(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	suites := manySuites(module, 8)
+	release := make(chan struct{})
+	executor := &fakeExecutor{release: release}
+	command := workerCommand(module, &memorySuiteCache{}, executor, make(chan frontend.Event, 32))
+	command.concurrency = 3
+	done := make(chan []suiteOutcome, 1)
+	go func() {
+		done <- command.runSuites(suites)
+	}()
+	waitForActiveExecutes(t, executor, 3)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("workers did not finish")
+	}
+	if got := executor.maxActive.Load(); got > 3 {
+		t.Fatalf("max active executes=%d, want at most 3", got)
+	}
+}
+
+// TestConcurrentCacheLookupsOverlap protects worker-per-suite cache parallelism.
+func TestConcurrentCacheLookupsOverlap(t *testing.T) {
 	module := moduleFixtureRoot(t)
 	suites := manySuites(module, 3)
 	resultCache := newConcurrentLookupCache(2, suites)
-	events := make(chan frontend.Event, eventChannelCapacity)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	command := &testCommand{
-		ctx: ctx, runCtx: ctx, frontendCtx: ctx, module: module,
-		resultCache: resultCache, tasks: make(chan run.SuiteTask), events: events,
-	}
-	done := make(chan struct{}, 1)
+	command := workerCommand(module, resultCache, &fakeExecutor{}, make(chan frontend.Event, 16))
+	command.concurrency = 2
+	done := make(chan []suiteOutcome, 1)
 	go func() {
-		command.dispatchPlannedSuites(suites)
-		done <- struct{}{}
+		done <- command.runSuites(suites)
 	}()
-	waitForDispatch(t, ctx, done)
-	want := []string{suites[0].Package.ImportPath, suites[1].Package.ImportPath, suites[2].Package.ImportPath}
-	if got := cachedEventPaths(events); strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("cached event order=%v, want %v", got, want)
+	select {
+	case <-resultCache.gate:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("cache lookups did not overlap")
+	}
+	select {
+	case outcomes := <-done:
+		summary := command.foldSummary(suites, outcomes)
+		if summary.Cached != len(suites) {
+			t.Fatalf("summary=%+v, want all suites cached", summary)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("workers did not finish")
 	}
 }
 
@@ -370,9 +332,7 @@ func TestInterruptCancelsBlockedCacheLookups(t *testing.T) {
 func TestSendRunPlanUsesShortenedPathWidth(t *testing.T) {
 	module := moduleFixtureRoot(t)
 	events := make(chan frontend.Event, 1)
-	command := &testCommand{
-		module: module, frontendCtx: context.Background(), events: events,
-	}
+	command := &testCommand{module: module, events: events}
 	suites := []fingerprint.Suite{
 		{Package: gotool.Package{ImportPath: module.Path}},
 		{Package: gotool.Package{ImportPath: module.Path + "/internal/deep/pkg"}},
@@ -386,7 +346,7 @@ func TestSendRunPlanUsesShortenedPathWidth(t *testing.T) {
 	}
 }
 
-// TestCommandRecordsPruneFailureAsCacheNote protects cache lifecycle non-fatality.
+// TestCommandRecordsPruneFailureAsCacheNote protects prune non-fatality.
 func TestCommandRecordsPruneFailureAsCacheNote(t *testing.T) {
 	module := moduleFixtureRoot(t)
 	passing := packageFixture(module, "passing")
@@ -429,63 +389,65 @@ func TestCommandRootCancellationRendersInterrupted(t *testing.T) {
 	if err != nil || code != 130 {
 		t.Fatalf("code=%d err=%v, want interrupted code", code, err)
 	}
-	// The skipped count races the async pipeline: a pre-cancelled context may
-	// or may not deliver the suite before shutdown, so 0 and 1 are both
-	// correct. The pinned behavior is the interruption rendering itself.
 	if !strings.Contains(errOut.String(), "interrupted;") || !strings.Contains(errOut.String(), "skipped") {
 		t.Fatalf("errOut=%q, want interruption summary", errOut.String())
 	}
 }
 
-// waitForDispatch waits for orchestration dispatch to finish before timeout.
-func waitForDispatch(t *testing.T, ctx context.Context, done <-chan struct{}) {
-	t.Helper()
-	select {
-	case <-done:
-	case <-ctx.Done():
-		t.Fatalf("dispatch timed out: %v", ctx.Err())
-	}
-}
-
-// waitForRunner waits for runner completion and fails on runner errors.
-func waitForRunner(t *testing.T, ctx context.Context, done <-chan error) {
-	t.Helper()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("runner error: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("runner timed out: %v", ctx.Err())
-	}
-}
-
 // TestOnlyPassingSuitesAreCachedAndFailuresDelete protects the cache-write policy.
 func TestOnlyPassingSuitesAreCachedAndFailuresDelete(t *testing.T) {
-	t.Setenv("RASK_CACHE_DIR", t.TempDir())
-	resultCache, err := cache.Open(cache.Config{
-		ModulePath: "example.com/m",
-		DiskDir:    t.TempDir(),
-		Remote:     nil,
+	resultCache := newRecordingSuiteCache(strings.Repeat("c", 64), cache.Entry{
+		ImportPath: "example.com/m/pass", Passed: 1,
 	})
-	if err != nil {
-		t.Fatalf("open cache: %v", err)
-	}
-	passing := suiteForTest("example.com/m/pass")
-	command := &testCommand{ctx: context.Background(), resultCache: resultCache}
-	command.recordSuiteResult(run.SuiteResult{
+	passing := suiteTaskForTest("example.com/m/pass")
+	command := &testCommand{ctx: context.Background(), resultCache: resultCache, cancelRun: func() {}}
+	command.recordRunOutcome(run.SuiteResult{
 		Package: passing.Package, Digest: passing.Digest, Completed: true,
 		Tests: []run.TestResult{{Name: "TestOK", Outcome: run.TestPassed}},
 	})
 	if _, found := resultCache.Get(context.Background(), passing.Digest); !found {
 		t.Fatalf("passing suite must be cached")
 	}
-	command.recordSuiteResult(run.SuiteResult{
+	command.recordRunOutcome(run.SuiteResult{
 		Package: passing.Package, Digest: passing.Digest, Completed: true, Failed: true,
 		Tests: []run.TestResult{{Name: "TestBad", Outcome: run.TestFailed}},
 	})
 	if _, found := resultCache.Get(context.Background(), passing.Digest); found {
 		t.Fatalf("failed suite must delete stale cache entry")
+	}
+}
+
+// TestCacheWriteFailureIncrementsSummary protects cache write diagnostics.
+func TestCacheWriteFailureIncrementsSummary(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	suite := manySuites(module, 1)[0]
+	resultCache := &recordingSuiteCache{
+		entries: map[string]cache.Entry{},
+		putErr:  fmt.Errorf("put failed"),
+	}
+	command := workerCommand(module, resultCache, &fakeExecutor{}, make(chan frontend.Event, 8))
+	outcomes := command.runSuites([]fingerprint.Suite{suite})
+	summary := command.foldSummary([]fingerprint.Suite{suite}, outcomes)
+	if summary.CacheErrors != 1 {
+		t.Fatalf("summary=%+v, want one cache error", summary)
+	}
+}
+
+// TestSummaryIncludesRemoteCounters protects remote stats rendering inputs.
+func TestSummaryIncludesRemoteCounters(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	suite := manySuites(module, 1)[0]
+	resultCache := &recordingSuiteCache{
+		entries: map[string]cache.Entry{},
+		remote:  true,
+		remoteStats: cache.RemoteStats{
+			Reads: 3, Writes: 2,
+		},
+	}
+	command := workerCommand(module, resultCache, &fakeExecutor{}, make(chan frontend.Event, 8))
+	summary := command.foldSummary([]fingerprint.Suite{suite}, []suiteOutcome{{kind: outcomeCached}})
+	if !summary.RemoteConfigured || summary.RemoteReads != 3 || summary.RemoteWrites != 2 || summary.RemoteCached != 3 {
+		t.Fatalf("summary=%+v, want remote counters", summary)
 	}
 }
 
@@ -511,18 +473,18 @@ func TestExecuteUsesRemoteTierEndToEnd(t *testing.T) {
 			`{"Action":"pass","Test":"TestOK"}` + "\n" +
 			`{"Action":"pass","Elapsed":0.01}` + "\n",
 	}}
-	code, out, errOut := executeWithTool(t, firstTool, "test", "./...")
+	code, _, errOut := executeWithTool(t, firstTool, "test", "./...")
 	if code != 0 {
 		t.Fatalf("first code=%d errOut=%q, want success", code, errOut)
 	}
 	t.Setenv("RASK_CACHE_DIR", t.TempDir())
 	secondTool := &fakeTool{module: module, all: []gotool.Package{passing}}
-	code, out, errOut = executeWithTool(t, secondTool, "test", "./...")
+	code, out, errOut := executeWithTool(t, secondTool, "test", "./...")
 	if code != 0 || !strings.Contains(out, "Cached passing") {
 		t.Fatalf("second code=%d out=%q errOut=%q, want remote cache hit", code, out, errOut)
 	}
-	if secondTool.started[passing.ImportPath] != 0 {
-		t.Fatalf("second run started %d suites, want remote cache hit", secondTool.started[passing.ImportPath])
+	if secondTool.startedCount(passing.ImportPath) != 0 {
+		t.Fatalf("second run started %d suites, want remote cache hit", secondTool.startedCount(passing.ImportPath))
 	}
 }
 
@@ -537,33 +499,46 @@ func manySuites(module gotool.Module, count int) []fingerprint.Suite {
 	return suites
 }
 
-// passingStreams returns one instant passing go-test stream per suite.
-func passingStreams(suites []fingerprint.Suite) map[string]string {
-	streams := make(map[string]string, len(suites))
+// failingResults returns one failed runner result per suite digest.
+func failingResults(suites []fingerprint.Suite) map[string]run.SuiteResult {
+	results := make(map[string]run.SuiteResult, len(suites))
 	for _, suite := range suites {
-		streams[suite.Package.ImportPath] = `{"Action":"run","Test":"TestOK"}` + "\n" +
-			`{"Action":"pass","Test":"TestOK"}` + "\n" +
-			`{"Action":"pass","Elapsed":0.01}` + "\n"
+		results[suite.Digest] = run.SuiteResult{
+			Failed: true,
+			Tests:  []run.TestResult{{Name: "TestBad", Outcome: run.TestFailed}},
+		}
 	}
-	return streams
+	return results
 }
 
-// noCacheCommandForTest returns an orchestration command with cache reads disabled.
-func noCacheCommandForTest(
-	t *testing.T,
+// workerCommand returns a command ready for direct worker-model tests.
+func workerCommand(
 	module gotool.Module,
-	tool gotool.Tool,
 	resultCache suiteCache,
+	executor suiteExecutor,
 	events chan frontend.Event,
 ) *testCommand {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	t.Cleanup(cancel)
 	return &testCommand{
-		ctx: ctx, runCtx: ctx, frontendCtx: ctx, module: module, tool: tool,
-		resultCache: resultCache, tasks: make(chan run.SuiteTask, 1),
-		results: make(chan run.Event, 1), events: events, resultsOpen: true,
-		noCache: true,
+		ctx: context.Background(), module: module, resultCache: resultCache,
+		executor: executor, events: events, startedAt: time.Now(),
+	}
+}
+
+// waitForActiveExecutes waits until a fake executor observes active workers.
+func waitForActiveExecutes(t *testing.T, executor *fakeExecutor, want int32) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if executor.active.Load() == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("active executes=%d, want %d", executor.active.Load(), want)
+		case <-tick.C:
+		}
 	}
 }
 
@@ -576,35 +551,6 @@ func drainHasCachedEvent(events <-chan frontend.Event) bool {
 		}
 	}
 	return false
-}
-
-// cachedEventPaths drains cached events so tests can assert orchestration order.
-func cachedEventPaths(events <-chan frontend.Event) []string {
-	paths := []string{}
-	for len(events) > 0 {
-		event := <-events
-		if event.Kind == frontend.EventCached {
-			paths = append(paths, event.Cached.ImportPath)
-		}
-	}
-	return paths
-}
-
-// dispatchSuites sends suites and drains remaining runner results.
-func dispatchSuites(command *testCommand, suites []fingerprint.Suite) {
-	slots := command.startCacheLookupPrefetch(suites)
-	for index, suite := range suites {
-		lookup := cacheLookup{}
-		if slots != nil {
-			lookup = <-slots[index]
-		}
-		command.processSuite(suite, lookup)
-	}
-	command.closeTasks()
-	for command.resultsOpen {
-		result, ok := <-command.results
-		command.resultsOpen = command.handleRunnerReceive(ok, result)
-	}
 }
 
 // executeWithTool runs Execute with a fake command environment.
@@ -630,6 +576,7 @@ func executeWithTool(t *testing.T, tool gotool.Tool, arguments ...string) (int, 
 	return code, out.String(), errOut.String()
 }
 
+// rootCommandForTest returns the command tree used by Execute tests.
 func rootCommandForTest() *cli.Command {
 	testCommand := Command()
 	return &cli.Command{
@@ -647,6 +594,7 @@ func rootCommandForTest() *cli.Command {
 	}
 }
 
+// newCommandS3Handler returns an in-memory S3-shaped cache endpoint.
 func newCommandS3Handler(t *testing.T) http.Handler {
 	t.Helper()
 	var mu sync.Mutex
@@ -700,18 +648,12 @@ func frontendForTest(out io.Writer, errOut io.Writer) (*frontend.Frontend, chan 
 // moduleFixtureRoot creates a minimal module directory for orchestration tests.
 func moduleFixtureRoot(t *testing.T) gotool.Module {
 	t.Helper()
-	return moduleFixtureRootWithGoMod(t, "module example.com/m\n\ngo 1.26\n")
-}
-
-// moduleFixtureRootWithGoMod creates a module fixture with custom go.mod content.
-func moduleFixtureRootWithGoMod(t *testing.T, goMod string) gotool.Module {
-	t.Helper()
 	dir := t.TempDir()
-	writeFile(t, dir, "go.mod", goMod)
+	writeFile(t, dir, "go.mod", "module example.com/m\n\ngo 1.26\n")
 	return gotool.Module{Path: "example.com/m", Dir: dir}
 }
 
-// packageFixture returns a selected package with one missing source and test file by default.
+// packageFixture returns a selected package with one source and test file.
 func packageFixture(module gotool.Module, name string) gotool.Package {
 	dir := filepath.Join(module.Dir, name)
 	return gotool.Package{
@@ -739,8 +681,8 @@ func writePackageFiles(t *testing.T, p gotool.Package) {
 	writeFile(t, p.Dir, p.TestGoFiles[0], "package "+p.Name+"\n")
 }
 
-// suiteForTest returns a runner suite with a valid cache-shaped digest.
-func suiteForTest(importPath string) run.SuiteTask {
+// suiteTaskForTest returns a runner suite with a valid cache-shaped digest.
+func suiteTaskForTest(importPath string) run.SuiteTask {
 	return run.SuiteTask{
 		Package: gotool.Package{Dir: "/tmp", ImportPath: importPath, TestGoFiles: []string{"x_test.go"}},
 		Digest:  strings.Repeat("c", 64),
@@ -749,6 +691,7 @@ func suiteForTest(importPath string) run.SuiteTask {
 
 // fakeTool provides the gotool seam for command orchestration tests.
 type fakeTool struct {
+	mu          sync.Mutex
 	module      gotool.Module
 	selected    []gotool.Package
 	all         []gotool.Package
@@ -761,12 +704,12 @@ type fakeTool struct {
 }
 
 // CurrentModule returns the configured module fixture.
-func (f *fakeTool) CurrentModule() (gotool.Module, error) {
+func (f *fakeTool) CurrentModule(context.Context) (gotool.Module, error) {
 	return f.module, nil
 }
 
 // ListPackages returns either the full closure or selected fixture packages.
-func (f *fakeTool) ListPackages(dir string, patterns []string) ([]gotool.Package, error) {
+func (f *fakeTool) ListPackages(_ context.Context, dir string, patterns []string) ([]gotool.Package, error) {
 	if len(patterns) == 1 && patterns[0] == "./..." {
 		if f.allByDir != nil {
 			return f.allByDir[dir], nil
@@ -777,12 +720,12 @@ func (f *fakeTool) ListPackages(dir string, patterns []string) ([]gotool.Package
 }
 
 // ListModules returns configured workspace modules for command tests.
-func (f *fakeTool) ListModules(string) ([]gotool.Module, error) {
+func (f *fakeTool) ListModules(context.Context, string) ([]gotool.Module, error) {
 	return f.modules, nil
 }
 
 // Environment returns a stable fake Go environment.
-func (f *fakeTool) Environment(string) ([]byte, error) {
+func (f *fakeTool) Environment(context.Context, string) ([]byte, error) {
 	if f.environment != nil {
 		return f.environment, nil
 	}
@@ -806,11 +749,20 @@ func (f *fakeTool) StartTests(ctx context.Context, _ string, importPath string) 
 	if !ok {
 		return nil, fmt.Errorf("unexpected StartTests call for %s", importPath)
 	}
+	f.mu.Lock()
 	if f.started == nil {
 		f.started = make(map[string]int)
 	}
 	f.started[importPath]++
+	f.mu.Unlock()
 	return fakeTestProcess{events: strings.NewReader(stream)}, nil
+}
+
+// startedCount returns a race-safe process start count for importPath.
+func (f *fakeTool) startedCount(importPath string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.started[importPath]
 }
 
 // fakeTestProcess implements gotool.TestProcess for command orchestration tests.
@@ -833,6 +785,89 @@ func (p fakeTestProcess) Stderr() string {
 	return ""
 }
 
+// fakeExecutor gives worker tests a deterministic per-suite runner.
+type fakeExecutor struct {
+	mu        sync.Mutex
+	results   map[string]run.SuiteResult
+	calls     map[string]int
+	release   <-chan struct{}
+	active    atomic.Int32
+	maxActive atomic.Int32
+}
+
+// Execute records concurrency and returns a configured or passing result.
+func (e *fakeExecutor) Execute(ctx context.Context, task run.SuiteTask, hooks run.Hooks) run.SuiteResult {
+	if hooks.Started != nil {
+		hooks.Started()
+	}
+	e.recordCall(task.Digest)
+	active := e.active.Add(1)
+	e.recordMax(active)
+	defer e.active.Add(-1)
+	if e.release != nil {
+		select {
+		case <-e.release:
+		case <-ctx.Done():
+			return run.SuiteResult{Package: task.Package, Digest: task.Digest, Killed: true}
+		}
+	}
+	if result, ok := e.resultFor(task.Digest); ok {
+		result.Package = task.Package
+		result.Digest = task.Digest
+		return result
+	}
+	return run.SuiteResult{
+		Package: task.Package, Digest: task.Digest, Completed: true,
+		Tests: []run.TestResult{{Name: "TestOK", Outcome: run.TestPassed}},
+	}
+}
+
+// recordCall counts one execution for digest under the fake's lock.
+func (e *fakeExecutor) recordCall(digest string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.calls == nil {
+		e.calls = make(map[string]int)
+	}
+	e.calls[digest]++
+}
+
+// recordMax raises the observed concurrency high-water mark.
+func (e *fakeExecutor) recordMax(active int32) {
+	for {
+		current := e.maxActive.Load()
+		if active <= current || e.maxActive.CompareAndSwap(current, active) {
+			return
+		}
+	}
+}
+
+// resultFor returns a configured result for digest.
+func (e *fakeExecutor) resultFor(digest string) (run.SuiteResult, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	result, ok := e.results[digest]
+	return result, ok
+}
+
+// callsFor returns how many times digest executed.
+func (e *fakeExecutor) callsFor(digest string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls[digest]
+}
+
+// totalCalls returns all executions observed by the fake.
+func (e *fakeExecutor) totalCalls() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	total := 0
+	for _, calls := range e.calls {
+		total += calls
+	}
+	return total
+}
+
 // memorySuiteCache is an in-memory no-op cache for command cancellation tests.
 type memorySuiteCache struct{}
 
@@ -849,9 +884,8 @@ func (c *memorySuiteCache) Put(context.Context, string, cache.Entry) error {
 // Delete accepts a cache delete.
 func (c *memorySuiteCache) Delete(context.Context, string) {}
 
-// Run waits for cancellation and then succeeds.
-func (c *memorySuiteCache) Run(ctx context.Context) error {
-	<-ctx.Done()
+// Prune succeeds because memory tests have no disk retention.
+func (c *memorySuiteCache) Prune() error {
 	return nil
 }
 
@@ -870,9 +904,8 @@ type failingPruneCache struct {
 	memorySuiteCache
 }
 
-// Run waits for cancellation and returns a prune failure.
-func (c *failingPruneCache) Run(ctx context.Context) error {
-	<-ctx.Done()
+// Prune returns the configured prune failure.
+func (c *failingPruneCache) Prune() error {
 	return fmt.Errorf("prune failed")
 }
 
@@ -881,9 +914,53 @@ type recordingSuiteCache struct {
 	entries     map[string]cache.Entry
 	remoteStats cache.RemoteStats
 	remote      bool
+	putErr      error
 	gets        int
 	puts        int
 	deletes     int
+}
+
+// newRecordingSuiteCache returns a cache seeded with one digest entry.
+func newRecordingSuiteCache(digest string, entry cache.Entry) *recordingSuiteCache {
+	return &recordingSuiteCache{entries: map[string]cache.Entry{digest: entry}}
+}
+
+// Get records a cache lookup and returns any seeded entry.
+func (c *recordingSuiteCache) Get(_ context.Context, digest string) (cache.Entry, bool) {
+	c.gets++
+	entry, found := c.entries[digest]
+	return entry, found
+}
+
+// Put records a cache write and refreshes the digest entry.
+func (c *recordingSuiteCache) Put(_ context.Context, digest string, entry cache.Entry) error {
+	c.puts++
+	if c.putErr != nil {
+		return c.putErr
+	}
+	c.entries[digest] = entry
+	return nil
+}
+
+// Delete records a cache delete and removes the digest entry.
+func (c *recordingSuiteCache) Delete(_ context.Context, digest string) {
+	c.deletes++
+	delete(c.entries, digest)
+}
+
+// Prune succeeds because tests assert write behavior separately.
+func (c *recordingSuiteCache) Prune() error {
+	return nil
+}
+
+// HasRemoteTier reports whether the recording cache has a remote tier.
+func (c *recordingSuiteCache) HasRemoteTier() bool {
+	return c.remote
+}
+
+// RemoteStats returns the configured remote traffic snapshot.
+func (c *recordingSuiteCache) RemoteStats() cache.RemoteStats {
+	return c.remoteStats
 }
 
 // concurrentLookupCache blocks until several lookups overlap.
@@ -923,7 +1000,7 @@ func (c *concurrentLookupCache) Get(ctx context.Context, digest string) (cache.E
 	return entry, found
 }
 
-// interruptLookupCache waits on ctx to prove prefetch cancellation is threaded.
+// interruptLookupCache waits on ctx to prove cache lookup cancellation is threaded.
 type interruptLookupCache struct {
 	memorySuiteCache
 	started chan struct{}
@@ -935,45 +1012,4 @@ func (c *interruptLookupCache) Get(ctx context.Context, _ string) (cache.Entry, 
 	c.once.Do(func() { close(c.started) })
 	<-ctx.Done()
 	return cache.Entry{}, false
-}
-
-// newRecordingSuiteCache returns a cache seeded with one digest entry.
-func newRecordingSuiteCache(digest string, entry cache.Entry) *recordingSuiteCache {
-	return &recordingSuiteCache{entries: map[string]cache.Entry{digest: entry}}
-}
-
-// Get records a cache lookup and returns any seeded entry.
-func (c *recordingSuiteCache) Get(_ context.Context, digest string) (cache.Entry, bool) {
-	c.gets++
-	entry, found := c.entries[digest]
-	return entry, found
-}
-
-// Put records a cache write and refreshes the digest entry.
-func (c *recordingSuiteCache) Put(_ context.Context, digest string, entry cache.Entry) error {
-	c.puts++
-	c.entries[digest] = entry
-	return nil
-}
-
-// Delete records a cache delete and removes the digest entry.
-func (c *recordingSuiteCache) Delete(_ context.Context, digest string) {
-	c.deletes++
-	delete(c.entries, digest)
-}
-
-// Run waits for cancellation and then succeeds.
-func (c *recordingSuiteCache) Run(ctx context.Context) error {
-	<-ctx.Done()
-	return nil
-}
-
-// HasRemoteTier reports whether the recording cache has a remote tier.
-func (c *recordingSuiteCache) HasRemoteTier() bool {
-	return c.remote
-}
-
-// RemoteStats returns the configured remote traffic snapshot.
-func (c *recordingSuiteCache) RemoteStats() cache.RemoteStats {
-	return c.remoteStats
 }

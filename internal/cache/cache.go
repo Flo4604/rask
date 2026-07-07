@@ -61,9 +61,8 @@ type Config struct {
 // Cache stores passing suite summaries under a module-specific prefix.
 //
 // Cache has no channels because cache lookups are request/response operations
-// owned by orchestration policy. Its methods may be used while Run is waiting.
-// Run exists for lifecycle uniformity: it blocks until ctx is cancelled, then
-// performs one best-effort final prune before returning the prune error, if any.
+// owned by orchestration policy. Its methods may be used concurrently by the
+// command's suite workers.
 type Cache struct {
 	store        objectStore
 	modulePrefix string
@@ -90,12 +89,11 @@ func Open(cfg Config) (*Cache, error) {
 	return newResultCache(store, cfg.ModulePath), nil
 }
 
-// Run waits for ctx cancellation and then prunes this module shard once.
+// Prune removes old entries after a run has stopped producing cache writes.
 //
-// Cache owns no channels. Its error is written by the command service wrapper
-// and observed only after the producer-service WaitGroup has completed.
-func (c *Cache) Run(ctx context.Context) error {
-	<-ctx.Done()
+// Pruning is a run-end concern now because callers own suite worker lifetimes;
+// running it after workers exit avoids racing normal passing-suite writes.
+func (c *Cache) Prune() error {
 	return c.prune(time.Now(), ageMax, objectCountPerModuleMax)
 }
 
