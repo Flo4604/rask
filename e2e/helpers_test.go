@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -244,10 +245,7 @@ func sanitizeName(name string) string {
 
 func startFakeS3(t *testing.T) (map[string]string, func()) {
 	t.Helper()
-	listener := loopbackListener(t)
-	server := httptest.NewUnstartedServer(fakeS3Handler("fake-access"))
-	server.Listener = listener
-	server.Start()
+	server := newLoopbackHTTPServer(t, fakeS3Handler("fake-access"))
 	env := s3Env("rask-e2e", "prefix", server.URL, "fake-access", "fake-secret")
 	stop := server.Close
 	t.Cleanup(stop)
@@ -257,14 +255,22 @@ func startFakeS3(t *testing.T) (map[string]string, func()) {
 // startDelayedFakeS3 isolates interrupt-latency tests from normal fake S3 speed.
 func startDelayedFakeS3(t *testing.T, delay time.Duration) (map[string]string, func()) {
 	t.Helper()
-	listener := loopbackListener(t)
-	server := httptest.NewUnstartedServer(delayedHandler(fakeS3Handler("fake-access"), delay))
-	server.Listener = listener
-	server.Start()
+	server := newLoopbackHTTPServer(t, delayedHandler(fakeS3Handler("fake-access"), delay))
 	env := s3Env("rask-e2e", "prefix", server.URL, "fake-access", "fake-secret")
 	stop := server.Close
 	t.Cleanup(stop)
 	return env, stop
+}
+
+// newLoopbackHTTPServer avoids httptest's default IPv6 listener in restricted sandboxes.
+func newLoopbackHTTPServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	server := &httptest.Server{
+		Listener: loopbackListener(t),
+		Config:   &http.Server{Handler: handler},
+	}
+	server.Start()
+	return server
 }
 
 // delayedHandler adds deterministic remote latency without changing S3 semantics.
@@ -317,6 +323,10 @@ func fakeS3Handler(accessKey string) http.Handler {
 			return
 		}
 		key := strings.TrimPrefix(r.URL.Path, "/")
+		if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
+			serveFakeS3List(w, r, key, &mu, objects)
+			return
+		}
 		switch r.Method {
 		case http.MethodGet:
 			mu.Lock()
@@ -343,6 +353,31 @@ func fakeS3Handler(accessKey string) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+func serveFakeS3List(
+	w http.ResponseWriter,
+	r *http.Request,
+	bucket string,
+	mu *sync.Mutex,
+	objects map[string][]byte,
+) {
+	prefix := bucket + "/" + r.URL.Query().Get("prefix")
+	mu.Lock()
+	keys := make([]string, 0, len(objects))
+	for key := range objects {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, strings.TrimPrefix(key, bucket+"/"))
+		}
+	}
+	mu.Unlock()
+	sort.Strings(keys)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("<ListBucketResult><IsTruncated>false</IsTruncated>"))
+	for _, key := range keys {
+		_, _ = fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", key)
+	}
+	_, _ = w.Write([]byte("</ListBucketResult>"))
 }
 
 // dockerRunMinio reads stdout only: `docker run -d` writes exactly the

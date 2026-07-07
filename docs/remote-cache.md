@@ -78,7 +78,7 @@ rask uses path-style S3 requests against the configured endpoint:
 
 `moduleKey` is `sha256(modulePath)[:16]`. `digest` is the 64-character suite digest. Both are lowercase hex. Each object is the same JSON cache entry used by the local disk store and is capped at 16 KiB.
 
-`Get` treats network errors, auth errors, non-2xx responses, oversized bodies, bare `404`, and S3 `NoSuchKey` responses as misses. `Put` and `Delete` are best-effort remote writes after the local disk operation. A misconfigured or unavailable bucket must not fail a test run after startup; affected suites rerun and local caching still works. Each request has a three-second timeout.
+`Get` treats network errors, auth errors, non-2xx responses, oversized bodies, bare `404`, and S3 `NoSuchKey` responses as misses. Normal `Put` and `Delete` calls are best-effort remote writes after the local disk operation. Explicit purge through `rask clean --remote` reports list and delete failures. A misconfigured or unavailable bucket must not fail a test run after startup; affected suites rerun and local caching still works. Each request has a three-second timeout.
 
 The final run summary shows successful remote cache hits and writes when the remote tier is configured:
 
@@ -90,7 +90,16 @@ Startup config errors are different: malformed config, old URL fields, invalid b
 
 ## Retention
 
-There is no rask process pruning the bucket. Remote retention belongs to bucket lifecycle rules. `rask clean` and local pruning remove only local disk objects; remote cache objects age out according to the bucket policy.
+There is no background rask process pruning the bucket. Age-based remote retention belongs to bucket lifecycle rules, and remote cache objects age out according to the bucket policy.
+
+Explicit purge is available when the configured credentials should remove objects immediately:
+
+```sh
+rask clean --remote
+rask clean --all --remote
+```
+
+`rask clean --remote` removes the current module's local cache shard, lists that module's remote shard, and deletes those remote objects. `rask clean --all --remote` removes the whole local cache root and deletes every remote object under rask's format-version prefix. Passing `--remote` without a configured remote cache fails with `no remote cache configured`.
 
 Lifecycle TTL counts from object creation, not last access. S3 and R2 do not track cache-object access time for lifecycle rules, so unlike the local LRU cache, an actively used verdict eventually expires. That is benign: the next run misses, reruns that suite, and writes a fresh object with a new creation time.
 

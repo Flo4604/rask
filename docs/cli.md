@@ -37,7 +37,9 @@ rask clean [options]
 
 ```sh
 rask clean
+rask clean --remote
 rask clean --all
+rask clean --all --remote
 ```
 
 Options:
@@ -45,8 +47,9 @@ Options:
 | Flag | Meaning |
 | --- | --- |
 | `--all` | Remove every rask-owned cache shard under the local cache root. |
+| `--remote` | Also purge configured remote cache objects after the local clean succeeds. |
 
-Without `--all`, `clean` removes only the current module's local cache shard. Remote S3-compatible buckets are not pruned by the client; configure bucket lifecycle rules instead.
+Without `--all`, `clean` removes only the current module's local cache shard. With `--remote`, it also deletes that module's objects from the configured remote cache. With both `--all` and `--remote`, it deletes every object under rask's remote cache format prefix. Passing `--remote` without a configured remote cache fails with `no remote cache configured`.
 
 ## Environment
 

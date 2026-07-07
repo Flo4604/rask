@@ -163,6 +163,15 @@ func (c *Cache) HasRemoteTier() bool {
 	return c.remote
 }
 
+// PurgeRemoteModule deletes this module's remote shard and returns the deleted count.
+func (c *Cache) PurgeRemoteModule(ctx context.Context) (int, error) {
+	store, ok := c.store.(*tieredStore)
+	if !ok || store.remote == nil {
+		return 0, fmt.Errorf("no remote cache configured")
+	}
+	return purgeRemotePrefix(ctx, store.remote, c.modulePrefix)
+}
+
 // RemoteStats returns successful remote cache traffic for this cache.
 func (c *Cache) RemoteStats() RemoteStats {
 	if store, ok := c.store.(*tieredStore); ok {
@@ -197,6 +206,34 @@ func CleanAll(diskDir string) error {
 		return err
 	}
 	return store.RemovePrefix("")
+}
+
+// PurgeRemoteAll deletes every remote object owned by this cache format version.
+func PurgeRemoteAll(ctx context.Context, remote *appconfig.Remote) (int, error) {
+	if remote == nil {
+		return 0, fmt.Errorf("no remote cache configured")
+	}
+	store, err := openS3ObjectStore(remote)
+	if err != nil {
+		return 0, err
+	}
+	return purgeRemotePrefix(ctx, store, formatVersion+"/")
+}
+
+// purgeRemotePrefix centralizes count-preserving error semantics for explicit purges.
+func purgeRemotePrefix(ctx context.Context, remote remoteStore, prefix string) (int, error) {
+	keys, err := remote.List(ctx, prefix)
+	if err != nil {
+		return 0, fmt.Errorf("listing remote cache objects: %w", err)
+	}
+	deleted := 0
+	for _, key := range keys {
+		if err := remote.Delete(ctx, key); err != nil {
+			return deleted, fmt.Errorf("deleting remote cache object after deleting %d: %w", deleted, err)
+		}
+		deleted++
+	}
+	return deleted, nil
 }
 
 // store is the minimal storage contract used by cache pruning and test fakes.

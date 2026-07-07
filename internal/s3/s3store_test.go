@@ -3,6 +3,7 @@ package s3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -96,6 +97,56 @@ func TestStoreRequestHeaders(t *testing.T) {
 	}))
 	if err := store.Put(context.Background(), objectKeyForTest("d"), []byte(`{"ok":true}`)); err != nil {
 		t.Fatalf("put: %v", err)
+	}
+}
+
+// TestStoreListReturnsOnlyCacheKeys protects purge from deleting foreign objects.
+//
+// Listed names use the flat remote layout (no digest shard); List must map
+// them back to shard-carrying cache keys and drop every other shape.
+func TestStoreListReturnsOnlyCacheKeys(t *testing.T) {
+	store := handlerStoreForTest(t, listHandlerForTest(t, []listResponseForTest{
+		{
+			keys: []string{
+				"prefix/" + remoteObjectNameForTest("f"),
+				"prefix/v1/" + moduleKeyForTest() + "/not-a-digest.json",
+				"prefix/" + objectKeyForTest("e"), // shard-carrying names never exist remotely
+				"prefix/foreign.txt",
+			},
+			truncated: true,
+			nextToken: "next page",
+		},
+		{keys: []string{"prefix/" + remoteObjectNameForTest("1")}},
+	}))
+	keys, err := store.List(context.Background(), "v1/"+moduleKeyForTest()+"/")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	want := []string{objectKeyForTest("f"), objectKeyForTest("1")}
+	if strings.Join(keys, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("keys=%v, want %v", keys, want)
+	}
+}
+
+// remoteObjectNameForTest mirrors objectName's flat remote layout for one digest fill.
+func remoteObjectNameForTest(fill string) string {
+	digest := strings.Repeat(fill, hashHexLength)
+	return "v1/" + moduleKeyForTest() + "/" + digest + ".json"
+}
+
+// TestStoreListSignsCanonicalQuery protects SigV4 query sorting for ListObjectsV2.
+func TestStoreListSignsCanonicalQuery(t *testing.T) {
+	store := handlerStoreForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := signatureFromAuthorization(r.Header.Get("Authorization")), "6f13d0934127435d6e4a8fe602297524225a4c6af264cecfed025c8600282e22"; got != want {
+			t.Fatalf("signature=%s, want %s", got, want)
+		}
+		if got, want := r.URL.Query().Get("prefix"), "prefix/v1/"+moduleKeyForTest()+"/"; got != want {
+			t.Fatalf("prefix=%q, want %q", got, want)
+		}
+		_, _ = w.Write([]byte(`<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`))
+	}))
+	if _, err := store.List(context.Background(), "v1/"+moduleKeyForTest()+"/"); err != nil {
+		t.Fatalf("list: %v", err)
 	}
 }
 
@@ -193,6 +244,37 @@ func newObjectHandlerForTest(t *testing.T) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+func listHandlerForTest(t *testing.T, pages []listResponseForTest) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Query().Get("list-type") != "2" {
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		index := 0
+		if r.URL.Query().Get("continuation-token") != "" {
+			index = 1
+		}
+		if index >= len(pages) {
+			http.Error(w, "unexpected page", http.StatusBadRequest)
+			return
+		}
+		writeListResponseForTest(w, pages[index])
+	})
+}
+
+func writeListResponseForTest(w io.Writer, page listResponseForTest) {
+	fmt.Fprint(w, "<ListBucketResult>")
+	for _, key := range page.keys {
+		fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", key)
+	}
+	fmt.Fprintf(w, "<IsTruncated>%t</IsTruncated>", page.truncated)
+	if page.nextToken != "" {
+		fmt.Fprintf(w, "<NextContinuationToken>%s</NextContinuationToken>", page.nextToken)
+	}
+	fmt.Fprint(w, "</ListBucketResult>")
 }
 
 func serveGet(w http.ResponseWriter, key string, mu *sync.Mutex, objects map[string][]byte) {
@@ -356,4 +438,10 @@ type timeoutTransport struct{}
 func (t timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	<-req.Context().Done()
 	return nil, req.Context().Err()
+}
+
+type listResponseForTest struct {
+	keys      []string
+	truncated bool
+	nextToken string
 }

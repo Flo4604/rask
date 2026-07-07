@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -184,6 +188,66 @@ func TestTieredStoreRemoteGetHonorsContextCancellation(t *testing.T) {
 	}
 }
 
+// TestPurgeRemoteModuleDeletesOnlyShard protects module-scoped remote cleanup.
+func TestPurgeRemoteModuleDeletesOnlyShard(t *testing.T) {
+	fake, remote := startCacheS3Fake(t)
+	left := openRemoteCacheForTest(t, "example.com/left", remote)
+	right := openRemoteCacheForTest(t, "example.com/right", remote)
+	leftDigest := digestForTest("e")
+	rightDigest := digestForTest("f")
+	if err := left.Put(context.Background(), leftDigest, entryForTest()); err != nil {
+		t.Fatalf("seed left: %v", err)
+	}
+	if err := right.Put(context.Background(), rightDigest, entryForTest()); err != nil {
+		t.Fatalf("seed right: %v", err)
+	}
+	count, err := left.PurgeRemoteModule(context.Background())
+	if err != nil {
+		t.Fatalf("purge left: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("deleted=%d, want 1", count)
+	}
+	if fake.HasCacheKey(left.objectKey(leftDigest)) {
+		t.Fatalf("left remote object survived purge")
+	}
+	if !fake.HasCacheKey(right.objectKey(rightDigest)) {
+		t.Fatalf("right remote object was deleted")
+	}
+}
+
+// TestPurgeRemoteDeleteFailureReportsCount protects explicit purge errors.
+func TestPurgeRemoteDeleteFailureReportsCount(t *testing.T) {
+	fake, remote := startCacheS3Fake(t)
+	first := objectKeyForParts(moduleKeyForPath("example.com/a"), digestForTest("1"))
+	second := objectKeyForParts(moduleKeyForPath("example.com/b"), digestForTest("2"))
+	fake.SeedCacheKey(first, []byte(`{"ok":true}`))
+	fake.SeedCacheKey(second, []byte(`{"ok":true}`))
+	fake.FailDelete(second)
+	count, err := PurgeRemoteAll(context.Background(), remote)
+	if err == nil || !strings.Contains(err.Error(), "after deleting 1") {
+		t.Fatalf("purge err=%v, want count context", err)
+	}
+	if count != 1 {
+		t.Fatalf("deleted=%d, want 1", count)
+	}
+	if fake.HasCacheKey(first) {
+		t.Fatalf("first object survived before failing delete")
+	}
+	if !fake.HasCacheKey(second) {
+		t.Fatalf("failed delete removed second object")
+	}
+}
+
+// TestPurgeRemoteModuleRequiresRemote protects the defensive no-remote error.
+func TestPurgeRemoteModuleRequiresRemote(t *testing.T) {
+	resultCache := openCacheAt(t, t.TempDir(), "example.com/m")
+	if _, err := resultCache.PurgeRemoteModule(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "no remote cache configured") {
+		t.Fatalf("err=%v, want no remote error", err)
+	}
+}
+
 func assertRemoteBackfill(t *testing.T, local *diskStore, remote *memoryRemoteStore, requests *requestCounts) {
 	t.Helper()
 	remoteDigest := digestForTest("2")
@@ -265,6 +329,19 @@ func newTieredCacheForTest(t *testing.T) (*diskStore, *memoryRemoteStore, *reque
 	return local, remote, requests
 }
 
+func openRemoteCacheForTest(t *testing.T, modulePath string, remote *appconfig.Remote) *Cache {
+	t.Helper()
+	resultCache, err := Open(Config{
+		ModulePath: modulePath,
+		DiskDir:    t.TempDir(),
+		Remote:     remote,
+	})
+	if err != nil {
+		t.Fatalf("open remote cache: %v", err)
+	}
+	return resultCache
+}
+
 func assertCacheHit(t *testing.T, resultCache *Cache, digest string) {
 	t.Helper()
 	if _, found := resultCache.Get(context.Background(), digest); !found {
@@ -336,6 +413,149 @@ func remoteConfigForTest(bucket string, prefix string, endpoint string) *appconf
 	}
 }
 
+func startCacheS3Fake(t *testing.T) (*cacheS3Fake, *appconfig.Remote) {
+	t.Helper()
+	fake := newCacheS3Fake("rask-cache", "prefix")
+	server := &httptest.Server{
+		Listener: cacheLoopbackListenerForTest(t),
+		Config:   &http.Server{Handler: fake},
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+	return fake, remoteConfigForTest(fake.bucket, fake.prefix, server.URL)
+}
+
+func cacheLoopbackListenerForTest(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("loopback bind unavailable in this sandbox: %v", err)
+		}
+		t.Fatalf("allocate loopback port: %v", err)
+	}
+	return listener
+}
+
+type cacheS3Fake struct {
+	mu         sync.Mutex
+	bucket     string
+	prefix     string
+	objects    map[string][]byte
+	failDelete map[string]bool
+}
+
+func newCacheS3Fake(bucket string, prefix string) *cacheS3Fake {
+	return &cacheS3Fake{
+		bucket: bucket, prefix: prefix,
+		objects: map[string][]byte{}, failDelete: map[string]bool{},
+	}
+}
+
+func (f *cacheS3Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+		http.Error(w, "unauthorized", http.StatusForbidden)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
+		f.ServeList(w, r)
+		return
+	}
+	key := strings.TrimPrefix(r.URL.Path, "/")
+	switch r.Method {
+	case http.MethodGet:
+		f.ServeGet(w, key)
+	case http.MethodPut:
+		f.ServePut(w, r, key)
+	case http.MethodDelete:
+		f.ServeDelete(w, key)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (f *cacheS3Fake) SeedCacheKey(key string, body []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.objects[f.cacheObjectName(key)] = append([]byte(nil), body...)
+}
+
+func (f *cacheS3Fake) HasCacheKey(key string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, found := f.objects[f.cacheObjectName(key)]
+	return found
+}
+
+func (f *cacheS3Fake) FailDelete(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failDelete[f.cacheObjectName(key)] = true
+}
+
+func (f *cacheS3Fake) ServeGet(w http.ResponseWriter, key string) {
+	f.mu.Lock()
+	body, found := f.objects[key]
+	f.mu.Unlock()
+	if !found {
+		http.NotFound(w, nil)
+		return
+	}
+	_, _ = w.Write(append([]byte(nil), body...))
+}
+
+func (f *cacheS3Fake) ServePut(w http.ResponseWriter, r *http.Request, key string) {
+	body, _ := io.ReadAll(r.Body)
+	f.mu.Lock()
+	f.objects[key] = append([]byte(nil), body...)
+	f.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (f *cacheS3Fake) ServeDelete(w http.ResponseWriter, key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failDelete[key] {
+		http.Error(w, "delete failed", http.StatusInternalServerError)
+		return
+	}
+	delete(f.objects, key)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (f *cacheS3Fake) ServeList(w http.ResponseWriter, r *http.Request) {
+	keys := f.ListKeys(r.URL.Query().Get("prefix"))
+	fmt.Fprint(w, "<ListBucketResult><IsTruncated>false</IsTruncated>")
+	for _, key := range keys {
+		fmt.Fprintf(w, "<Contents><Key>%s</Key></Contents>", key)
+	}
+	fmt.Fprint(w, "</ListBucketResult>")
+}
+
+func (f *cacheS3Fake) ListKeys(prefix string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var keys []string
+	bucketPrefix := f.bucket + "/" + prefix
+	for key := range f.objects {
+		if strings.HasPrefix(key, bucketPrefix) {
+			keys = append(keys, strings.TrimPrefix(key, f.bucket+"/"))
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// cacheObjectName mirrors the client's flat remote layout: the two-character
+// digest shard exists only in cache keys, never in stored remote object names.
+func (f *cacheS3Fake) cacheObjectName(key string) string {
+	parts := strings.Split(key, "/")
+	if len(parts) == 4 {
+		parts = append(parts[:2], parts[3])
+	}
+	return f.bucket + "/" + f.prefix + "/" + strings.Join(parts, "/")
+}
+
 type memoryRemoteStore struct {
 	mu       sync.Mutex
 	objects  map[string][]byte
@@ -369,9 +589,24 @@ func (s *memoryRemoteStore) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+func (s *memoryRemoteStore) List(_ context.Context, prefix string) ([]string, error) {
+	s.requests.Add("LIST")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var keys []string
+	for key := range s.objects {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	return keys, nil
+}
+
 type failingRemoteStore struct {
-	getErr error
-	putErr error
+	getErr    error
+	putErr    error
+	listErr   error
+	deleteErr error
 }
 
 // blockingRemoteStore simulates a remote request that only ctx can interrupt.
@@ -393,6 +628,11 @@ func (s blockingRemoteStore) Delete(context.Context, string) error {
 	return nil
 }
 
+// List is unused because this fake exists only for read cancellation.
+func (s blockingRemoteStore) List(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+
 func (s *failingRemoteStore) Get(context.Context, string) ([]byte, bool, error) {
 	return nil, false, s.getErr
 }
@@ -402,7 +642,11 @@ func (s *failingRemoteStore) Put(context.Context, string, []byte) error {
 }
 
 func (s *failingRemoteStore) Delete(context.Context, string) error {
-	return nil
+	return s.deleteErr
+}
+
+func (s *failingRemoteStore) List(context.Context, string) ([]string, error) {
+	return nil, s.listErr
 }
 
 func (c *requestCounts) Add(method string) {

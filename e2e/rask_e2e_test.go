@@ -118,6 +118,25 @@ func TestTiered(t *testing.T) {
 	}, stop)
 }
 
+func TestCleanRemotePurgesFakeS3(t *testing.T) {
+	module := scaffoldModule(t, demoPackages(false)...)
+	remoteEnv, _ := startFakeS3(t)
+	machineA := envWithCache(t.TempDir(), remoteEnv)
+	assertCode(t, runRask(t, module.dir, machineA, "./..."), 0)
+	clean := runRask(t, module.dir, machineA, "clean", "--remote")
+	assertCode(t, clean, 0)
+	assertContains(t, clean.stdout, "Removed "+module.path)
+	assertContains(t, clean.stdout, "remote objects")
+	cold := runRask(t, module.dir, envWithCache(t.TempDir(), remoteEnv), "./...")
+	assertCode(t, cold, 0)
+	assertSuites(t, cold.stdout, "Passed", "bystander", "dep", "dependent")
+	assertNotContains(t, cold.stdout, "Cached ")
+	assertContains(t, cold.stdout, "remote: 0 reads")
+	noRemote := runRask(t, module.dir, cacheEnv(t.TempDir()), "clean", "--remote")
+	assertCode(t, noRemote, 1)
+	assertContains(t, noRemote.stderr, "no remote cache configured")
+}
+
 func TestTieredMinIO(t *testing.T) {
 	module := scaffoldModule(t, demoPackages(false)...)
 	remoteEnv := startMinio(t)

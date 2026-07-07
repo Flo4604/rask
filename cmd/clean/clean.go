@@ -10,6 +10,29 @@ import (
 	"github.com/chronark/rask/internal/setup"
 )
 
+const (
+	// remoteHint tells users how to make clean affect the shared tier.
+	remoteHint = "hint: pass --remote to also purge the remote cache"
+)
+
+var (
+	// cleanAllCache is swappable so command tests can prove flag routing without deleting fixtures.
+	cleanAllCache = cache.CleanAll
+
+	// openCache is swappable because clean owns command flow, not cache construction tests.
+	openCache = func(cfg cache.Config) (moduleCache, error) { return cache.Open(cfg) }
+
+	// purgeRemote is swappable so clean --all tests do not need a real S3 endpoint.
+	purgeRemote = cache.PurgeRemoteAll
+)
+
+// moduleCache is the narrow cache behavior needed by the clean command.
+type moduleCache interface {
+	RemoveModule() error
+	HasRemoteTier() bool
+	PurgeRemoteModule(ctx context.Context) (int, error)
+}
+
 // Action removes this module's cache shard or the whole cache store.
 func Action(ctx context.Context, command *cli.Command) error {
 	environment := setup.FromContext(ctx)
@@ -24,8 +47,11 @@ func Command() *cli.Command {
 		Name:        "clean",
 		Usage:       "Remove cached test results",
 		AcceptsArgs: true,
-		Flags:       []cli.Flag{cli.Bool("all", "remove every rask cache shard")},
-		Action:      Action,
+		Flags: []cli.Flag{
+			cli.Bool("all", "remove every rask cache shard"),
+			cli.Bool("remote", "also purge remote cache objects"),
+		},
+		Action: Action,
 	}
 }
 
@@ -37,18 +63,30 @@ func run(ctx context.Context, environment *setup.Environment, command *cli.Comma
 	if err != nil {
 		return 1, err
 	}
+	remote := command.Bool("remote")
+	if remote && cfg.Remote == nil {
+		return 1, fmt.Errorf("no remote cache configured")
+	}
 	if command.Bool("all") {
-		err := cache.CleanAll(cfg.CacheDir)
-		if err == nil && cfg.Remote != nil {
-			fmt.Fprintln(environment.Stderr, "remote cache retention is owned by bucket lifecycle rules")
+		if err := cleanAllCache(cfg.CacheDir); err != nil {
+			return 1, err
 		}
-		return 0, err
+		if remote {
+			count, err := purgeRemote(ctx, cfg.Remote)
+			if err != nil {
+				return 1, err
+			}
+			environment.Frontend.RenderRemoteRemoved(count)
+		} else if cfg.Remote != nil {
+			fmt.Fprintln(environment.Stderr, remoteHint)
+		}
+		return 0, nil
 	}
 	module, err := environment.Tool.CurrentModule(ctx)
 	if err != nil {
 		return 1, err
 	}
-	resultCache, err := cache.Open(cache.Config{
+	resultCache, err := openCache(cache.Config{
 		ModulePath: module.Path,
 		DiskDir:    cfg.CacheDir,
 		Remote:     cfg.Remote,
@@ -59,9 +97,15 @@ func run(ctx context.Context, environment *setup.Environment, command *cli.Comma
 	if err := resultCache.RemoveModule(); err != nil {
 		return 1, err
 	}
-	if resultCache.HasRemoteTier() {
-		fmt.Fprintln(environment.Stderr, "remote cache retention is owned by bucket lifecycle rules")
-	}
 	environment.Frontend.RenderRemoved(module.Path)
+	if remote {
+		count, err := resultCache.PurgeRemoteModule(ctx)
+		if err != nil {
+			return 1, err
+		}
+		environment.Frontend.RenderRemoteRemoved(count)
+	} else if resultCache.HasRemoteTier() {
+		fmt.Fprintln(environment.Stderr, remoteHint)
+	}
 	return 0, nil
 }

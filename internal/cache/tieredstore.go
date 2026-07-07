@@ -21,6 +21,9 @@ type remoteStore interface {
 	Get(ctx context.Context, key string) ([]byte, bool, error)
 	Put(ctx context.Context, key string, body []byte) error
 	Delete(ctx context.Context, key string) error
+
+	// List exposes remote keys only for explicit purge commands.
+	List(ctx context.Context, prefix string) ([]string, error)
 }
 
 // newTieredStore returns a disk-near, remote-far object store.
@@ -87,7 +90,7 @@ func (s *tieredStore) List(prefix string) ([]storedObject, error) {
 	return s.disk.List(prefix)
 }
 
-// RemovePrefix cleans only local cache contents; bucket lifecycle owns remote retention.
+// RemovePrefix cleans only local cache contents; explicit purge owns remote removal.
 func (s *tieredStore) RemovePrefix(prefix string) error {
 	return s.disk.RemovePrefix(prefix)
 }

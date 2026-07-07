@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +38,9 @@ const (
 
 	// moduleKeyHexLength is the number of SHA-256 hex characters used for module shards.
 	moduleKeyHexLength = 16
+
+	// listPagesMax bounds explicit purge scans so a broken server cannot loop forever.
+	listPagesMax = 100
 )
 
 // Config describes one S3-compatible remote cache bucket.
@@ -120,17 +124,39 @@ func (s *Client) Put(ctx context.Context, key string, body []byte) error {
 	return nil
 }
 
-// Delete asks S3 to remove an object and ignores all runtime failures.
+// Delete asks S3 to remove an object and reports transport or status failures.
 func (s *Client) Delete(ctx context.Context, key string) error {
 	request, ok := s.newRequest(ctx, http.MethodDelete, key, nil)
 	if !ok {
 		return nil
 	}
 	response, err := s.client.Do(request)
-	if err == nil {
-		_ = response.Body.Close()
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode/100 != 2 {
+		return fmt.Errorf("remote cache DELETE returned %s", response.Status)
 	}
 	return nil
+}
+
+// List returns cache-shaped keys under keyPrefix and surfaces remote failures.
+func (s *Client) List(ctx context.Context, keyPrefix string) ([]string, error) {
+	var keys []string
+	var token string
+	for range listPagesMax {
+		page, err := s.listPage(ctx, keyPrefix, token)
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, page.CacheKeys...)
+		if !page.IsTruncated {
+			return keys, nil
+		}
+		token = page.NextContinuationToken
+	}
+	return nil, fmt.Errorf("remote cache LIST exceeded %d pages", listPagesMax)
 }
 
 func (s *Client) newRequest(ctx context.Context, method string, key string, body io.Reader) (*http.Request, bool) {
@@ -154,6 +180,43 @@ func (s *Client) newRequest(ctx context.Context, method string, key string, body
 	return request, true
 }
 
+// listPage fetches one bounded ListObjectsV2 page for explicit purge.
+func (s *Client) listPage(ctx context.Context, keyPrefix string, token string) (listPage, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.listURL(keyPrefix, token), nil)
+	if err != nil {
+		return listPage{}, err
+	}
+	signS3Request(request, nil, s.accessKeyID, s.secretAccessKey, s.region, s.now().UTC())
+	response, err := s.client.Do(request)
+	if err != nil {
+		return listPage{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode/100 != 2 {
+		return listPage{}, fmt.Errorf("remote cache LIST returned %s", response.Status)
+	}
+	return s.decodeListPage(response.Body)
+}
+
+// decodeListPage keeps S3 XML parsing local to the explicit purge path.
+func (s *Client) decodeListPage(body io.Reader) (listPage, error) {
+	var result listBucketResult
+	if err := xml.NewDecoder(body).Decode(&result); err != nil {
+		return listPage{}, fmt.Errorf("decoding remote cache LIST: %w", err)
+	}
+	page := listPage{
+		IsTruncated:           result.IsTruncated,
+		NextContinuationToken: result.NextContinuationToken,
+	}
+	for _, content := range result.Contents {
+		if key, ok := s.cacheKeyFromObjectName(content.Key); ok {
+			page.CacheKeys = append(page.CacheKeys, key)
+		}
+	}
+	return page, nil
+}
+
+// objectName maps one validated cache key to the configured S3 object name.
 func (s *Client) objectName(key string) (string, bool) {
 	moduleKey, digest, ok := objectPartsFromKey(key)
 	if !ok {
@@ -163,12 +226,71 @@ func (s *Client) objectName(key string) (string, bool) {
 	return strings.Trim(strings.Join(parts, "/"), "/"), true
 }
 
+// cacheKeyFromObjectName refuses listed objects outside rask's current key shape.
+//
+// Remote object names are flatter than cache keys: objectName strips the
+// two-character digest shard on write, so listings come back as
+// v1/<module>/<digest>.json and the shard must be reconstructed here. Anything
+// else under the prefix is foreign and must never be deleted by a purge.
+func (s *Client) cacheKeyFromObjectName(objectName string) (string, bool) {
+	prefix := strings.Trim(s.prefix, "/")
+	if prefix != "" {
+		var found bool
+		objectName, found = strings.CutPrefix(objectName, prefix+"/")
+		if !found {
+			return "", false
+		}
+	}
+	parts := strings.Split(objectName, "/")
+	if len(parts) != 3 || parts[0] != formatVersion {
+		return "", false
+	}
+	digest := strings.TrimSuffix(parts[2], ".json")
+	if digest == parts[2] || !validDigest(digest) || !validModuleKey(parts[1]) {
+		return "", false
+	}
+	return strings.Join([]string{formatVersion, parts[1], digest[:2], digest + ".json"}, "/"), true
+}
+
+// objectURL builds the path-style URL used by object GET, PUT, and DELETE.
 func (s *Client) objectURL(objectName string) string {
 	next := *s.endpoint
 	next.Path = joinURLPath(s.endpoint.Path, s.bucket, objectName)
 	next.RawQuery = ""
 	next.Fragment = ""
 	return next.String()
+}
+
+// listURL builds the bucket-level ListObjectsV2 request URL.
+func (s *Client) listURL(keyPrefix string, token string) string {
+	values := url.Values{
+		"list-type": []string{"2"},
+		"prefix":    []string{s.objectListPrefix(keyPrefix)},
+	}
+	if token != "" {
+		values.Set("continuation-token", token)
+	}
+	next := *s.endpoint
+	next.Path = joinURLPath(s.endpoint.Path, s.bucket)
+	next.RawQuery = canonicalQueryString(values)
+	next.Fragment = ""
+	return next.String()
+}
+
+// objectListPrefix joins the configured object prefix to a cache-key prefix.
+func (s *Client) objectListPrefix(keyPrefix string) string {
+	parts := []string{}
+	for _, part := range []string{s.prefix, keyPrefix} {
+		trimmed := strings.Trim(part, "/")
+		if trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	joined := strings.Join(parts, "/")
+	if strings.HasSuffix(keyPrefix, "/") && joined != "" {
+		return joined + "/"
+	}
+	return joined
 }
 
 func parseS3Endpoint(rawURL string) (*url.URL, error) {
@@ -211,12 +333,34 @@ func canonicalRequest(req *http.Request, payloadHash string) (string, string) {
 	parts := []string{
 		req.Method,
 		req.URL.EscapedPath(),
-		req.URL.Query().Encode(),
+		canonicalQueryString(req.URL.Query()),
 		headers,
 		signedHeaders,
 		payloadHash,
 	}
 	return strings.Join(parts, "\n"), signedHeaders
+}
+
+// canonicalQueryString applies SigV4 sorting and percent-encoding to query pairs.
+func canonicalQueryString(values url.Values) string {
+	if len(values) == 0 {
+		return ""
+	}
+	pairs := []string{}
+	for name, list := range values {
+		for _, value := range list {
+			pairs = append(pairs, s3QueryEscape(name)+"="+s3QueryEscape(value))
+		}
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, "&")
+}
+
+// s3QueryEscape uses SigV4 query escaping rather than form-style plus escaping.
+func s3QueryEscape(value string) string {
+	escaped := url.QueryEscape(value)
+	escaped = strings.ReplaceAll(escaped, "+", "%20")
+	return strings.ReplaceAll(escaped, "%7E", "~")
 }
 
 func canonicalHeaders(req *http.Request) (string, string) {
@@ -276,6 +420,25 @@ func sha256Hex(body []byte) string {
 
 func trimHeaderValue(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+// listBucketResult is the ListObjectsV2 XML shape needed for cache purges.
+type listBucketResult struct {
+	Contents              []listBucketContent `xml:"Contents"`
+	IsTruncated           bool                `xml:"IsTruncated"`
+	NextContinuationToken string              `xml:"NextContinuationToken"`
+}
+
+// listBucketContent keeps object keys separate from unused S3 object metadata.
+type listBucketContent struct {
+	Key string `xml:"Key"`
+}
+
+// listPage carries only validated cache keys plus pagination state.
+type listPage struct {
+	CacheKeys             []string
+	IsTruncated           bool
+	NextContinuationToken string
 }
 
 func objectPartsFromKey(key string) (string, string, bool) {

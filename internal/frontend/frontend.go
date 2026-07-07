@@ -366,6 +366,11 @@ func (f *Frontend) RenderRemoved(modulePath string) {
 	f.removed(modulePath)
 }
 
+// RenderRemoteRemoved renders an explicit remote-cache purge status.
+func (f *Frontend) RenderRemoteRemoved(objectCount int) {
+	f.status(colorGreenBold, "Removed", "%d remote %s", objectCount, plural(objectCount, "object"))
+}
+
 // Run consumes render events until the event channel closes and returns the final exit code.
 //
 // Run should be the only goroutine writing terminal output during test runs.
