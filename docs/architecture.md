@@ -110,7 +110,7 @@ On the first failed suite, orchestration cancels the run context. In-flight test
 
 ## Testing tiers
 
-The test suite has three tiers. Hermetic unit and golden tests cover pure package behavior and rendering without touching subprocesses or the user's machine state. Seam tests use fakes at package boundaries such as the Go tool, runner, cache, and frontend services to exercise orchestration behavior that would be slow or brittle through a real process tree.
+The test suite has three tiers. Hermetic unit and golden tests cover pure package behavior and rendering without touching subprocesses or the user's machine state. Seam tests use fakes at package boundaries such as the Go tool, executor, cache, and frontend to exercise orchestration behavior that would be slow or brittle through a real process tree.
 
 The `e2e` package is the outer tier. It runs as part of ordinary `go test ./...`. Those tests build the real `rask` binary once, scaffold temporary Go modules, run real subprocesses through the real Go toolchain, and isolate every run with a temporary `RASK_CACHE_DIR`.
 
