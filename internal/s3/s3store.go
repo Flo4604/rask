@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -82,8 +83,8 @@ func New(cfg Config) (*Client, error) {
 }
 
 // Get returns a decoded remote object body or a miss for every remote failure.
-func (s *Client) Get(key string) ([]byte, bool, error) {
-	request, ok := s.newRequest(http.MethodGet, key, nil)
+func (s *Client) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	request, ok := s.newRequest(ctx, http.MethodGet, key, nil)
 	if !ok {
 		return nil, false, nil
 	}
@@ -103,8 +104,8 @@ func (s *Client) Get(key string) ([]byte, bool, error) {
 }
 
 // Put writes a remote object and reports failures for the tiered store to count.
-func (s *Client) Put(key string, body []byte) error {
-	request, ok := s.newRequest(http.MethodPut, key, bytes.NewReader(body))
+func (s *Client) Put(ctx context.Context, key string, body []byte) error {
+	request, ok := s.newRequest(ctx, http.MethodPut, key, bytes.NewReader(body))
 	if !ok {
 		return errors.New("malformed cache key")
 	}
@@ -120,8 +121,8 @@ func (s *Client) Put(key string, body []byte) error {
 }
 
 // Delete asks S3 to remove an object and ignores all runtime failures.
-func (s *Client) Delete(key string) error {
-	request, ok := s.newRequest(http.MethodDelete, key, nil)
+func (s *Client) Delete(ctx context.Context, key string) error {
+	request, ok := s.newRequest(ctx, http.MethodDelete, key, nil)
 	if !ok {
 		return nil
 	}
@@ -132,12 +133,12 @@ func (s *Client) Delete(key string) error {
 	return nil
 }
 
-func (s *Client) newRequest(method string, key string, body io.Reader) (*http.Request, bool) {
+func (s *Client) newRequest(ctx context.Context, method string, key string, body io.Reader) (*http.Request, bool) {
 	objectName, ok := s.objectName(key)
 	if !ok {
 		return nil, false
 	}
-	request, err := http.NewRequest(method, s.objectURL(objectName), body)
+	request, err := http.NewRequestWithContext(ctx, method, s.objectURL(objectName), body)
 	if err != nil {
 		return nil, false
 	}

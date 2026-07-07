@@ -1,8 +1,10 @@
 package s3
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,22 +13,30 @@ import (
 	"time"
 )
 
+const (
+	// cancelDelayForTest gives the request time to reach the blocking handler.
+	cancelDelayForTest = 50 * time.Millisecond
+
+	// cancelledRequestMax proves context cancellation wins over the S3 timeout.
+	cancelledRequestMax = 500 * time.Millisecond
+)
+
 func TestStoreRoundTrip(t *testing.T) {
 	store := handlerStoreForTest(t, newObjectHandlerForTest(t))
 	key := objectKeyForTest("a")
-	if _, found, err := store.Get(key); err != nil || found {
+	if _, found, err := store.Get(context.Background(), key); err != nil || found {
 		t.Fatalf("empty remote cache Get = found %v err %v", found, err)
 	}
-	if err := store.Put(key, []byte(`{"ok":true}`)); err != nil {
+	if err := store.Put(context.Background(), key, []byte(`{"ok":true}`)); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if _, found, err := store.Get(key); err != nil || !found {
+	if _, found, err := store.Get(context.Background(), key); err != nil || !found {
 		t.Fatalf("remote cache Get = found %v err %v", found, err)
 	}
-	if err := store.Delete(key); err != nil {
+	if err := store.Delete(context.Background(), key); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, found, err := store.Get(key); err != nil || found {
+	if _, found, err := store.Get(context.Background(), key); err != nil || found {
 		t.Fatalf("deleted object Get = found %v err %v", found, err)
 	}
 }
@@ -44,7 +54,7 @@ func TestStoreTreatsNoSuchKeyAsMiss(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := handlerStoreForTest(t, handler)
-			if _, found, err := store.Get(key); err != nil || found {
+			if _, found, err := store.Get(context.Background(), key); err != nil || found {
 				t.Fatalf("Get = found %v err %v, want miss without error", found, err)
 			}
 		})
@@ -60,12 +70,12 @@ func TestStoreFailurePolicy(t *testing.T) {
 		"oversized": oversizedStoreForTest(t),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, found, err := store.Get(key); err != nil || found {
+			if _, found, err := store.Get(context.Background(), key); err != nil || found {
 				t.Fatalf("Get = found %v err %v, want miss without error", found, err)
 			}
 		})
 	}
-	if err := refusedStoreForTest(t).Put(key, []byte(`{"ok":true}`)); err == nil {
+	if err := refusedStoreForTest(t).Put(context.Background(), key, []byte(`{"ok":true}`)); err == nil {
 		t.Fatalf("Put network failure must be a counted write error")
 	}
 }
@@ -84,9 +94,51 @@ func TestStoreRequestHeaders(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
-	if err := store.Put(objectKeyForTest("d"), []byte(`{"ok":true}`)); err != nil {
+	if err := store.Put(context.Background(), objectKeyForTest("d"), []byte(`{"ok":true}`)); err != nil {
 		t.Fatalf("put: %v", err)
 	}
+}
+
+// TestStoreGetHonorsContextCancellation protects prompt Ctrl+C shutdown.
+func TestStoreGetHonorsContextCancellation(t *testing.T) {
+	listener := loopbackListenerForTest(t)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	store, err := New(Config{
+		Bucket: "bucket", Prefix: "prefix", Region: "auto", Endpoint: server.URL,
+		AccessKeyID: "access", SecretAccessKey: "secret",
+	})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(cancelDelayForTest, cancel)
+	startedAt := time.Now()
+	_, found, err := store.Get(ctx, objectKeyForTest("e"))
+	elapsed := time.Since(startedAt)
+	if err != nil || found {
+		t.Fatalf("Get = found %v err %v, want silent miss", found, err)
+	}
+	if elapsed > cancelledRequestMax {
+		t.Fatalf("cancelled Get took %s, want under %s", elapsed, cancelledRequestMax)
+	}
+}
+
+// loopbackListenerForTest keeps httptest usable in IPv6-restricted sandboxes.
+func loopbackListenerForTest(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("loopback bind unavailable in this sandbox: %v", err)
+		}
+		t.Fatalf("allocate loopback port: %v", err)
+	}
+	return listener
 }
 
 func TestSigV4SigningVectors(t *testing.T) {

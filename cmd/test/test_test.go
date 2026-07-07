@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,12 @@ import (
 	"github.com/chronark/rask/internal/run"
 	"github.com/chronark/rask/internal/setup"
 )
+
+// commandResult carries run completion across a watchdog channel.
+type commandResult struct {
+	code int
+	err  error
+}
 
 // TestExecuteReturnsZeroForPassingRun protects Execute success exit-code behavior.
 func TestExecuteReturnsZeroForPassingRun(t *testing.T) {
@@ -260,7 +267,8 @@ func TestNoCacheBypassesHitsAndRefreshesPasses(t *testing.T) {
 		resultCache: resultCache, tasks: make(chan run.SuiteTask, 1), events: events,
 		summary: frontend.Summary{Suites: 1},
 	}
-	cached.processSuite(suite)
+	slots := cached.startCacheLookupPrefetch([]fingerprint.Suite{suite})
+	cached.processSuite(suite, <-slots[0])
 	if resultCache.gets != 1 || cached.summary.Cached != 1 || cached.summary.Passed != 1 {
 		t.Fatalf("cached path gets=%d summary=%+v, want one cached hit", resultCache.gets, cached.summary)
 	}
@@ -286,6 +294,75 @@ func TestNoCacheBypassesHitsAndRefreshesPasses(t *testing.T) {
 	}
 	if drainHasCachedEvent(events) {
 		t.Fatalf("no-cache path emitted cached event")
+	}
+}
+
+// TestConcurrentCacheLookupsStayOrdered protects bounded prefetch ordering.
+func TestConcurrentCacheLookupsStayOrdered(t *testing.T) {
+	module := moduleFixtureRoot(t)
+	suites := manySuites(module, 3)
+	resultCache := newConcurrentLookupCache(2, suites)
+	events := make(chan frontend.Event, eventChannelCapacity)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	command := &testCommand{
+		ctx: ctx, runCtx: ctx, frontendCtx: ctx, module: module,
+		resultCache: resultCache, tasks: make(chan run.SuiteTask), events: events,
+	}
+	done := make(chan struct{}, 1)
+	go func() {
+		command.dispatchPlannedSuites(suites)
+		done <- struct{}{}
+	}()
+	waitForDispatch(t, ctx, done)
+	want := []string{suites[0].Package.ImportPath, suites[1].Package.ImportPath, suites[2].Package.ImportPath}
+	if got := cachedEventPaths(events); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("cached event order=%v, want %v", got, want)
+	}
+}
+
+// TestInterruptCancelsBlockedCacheLookups protects Ctrl+C exit latency.
+func TestInterruptCancelsBlockedCacheLookups(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	module := moduleFixtureRoot(t)
+	packages := make([]gotool.Package, 0, 8)
+	for _, suite := range manySuites(module, 8) {
+		writePackageFiles(t, suite.Package)
+		packages = append(packages, suite.Package)
+	}
+	out := new(strings.Builder)
+	errOut := new(strings.Builder)
+	ui, events := frontendForTest(out, errOut)
+	resultCache := &interruptLookupCache{started: make(chan struct{})}
+	command := newTestCommand(ctx, &fakeTool{module: module, all: packages}, module, module.Dir, resultCache, testArguments{
+		patterns: []string{"./..."},
+	}, ui, events)
+	done := make(chan commandResult, 1)
+	go func() {
+		code, err := command.run()
+		done <- commandResult{code: code, err: err}
+	}()
+	select {
+	case <-resultCache.started:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("cache lookup did not start")
+	}
+	startedAt := time.Now()
+	cancel()
+	select {
+	case result := <-done:
+		if result.err != nil || result.code != 130 {
+			t.Fatalf("code=%d err=%v, want interrupted code", result.code, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("interrupted run did not return promptly")
+	}
+	if elapsed := time.Since(startedAt); elapsed > 5*time.Second {
+		t.Fatalf("interrupt latency=%s, want under 5s", elapsed)
+	}
+	if !strings.Contains(errOut.String(), "interrupted;") {
+		t.Fatalf("errOut=%q, want interrupted summary", errOut.String())
 	}
 }
 
@@ -395,19 +472,19 @@ func TestOnlyPassingSuitesAreCachedAndFailuresDelete(t *testing.T) {
 		t.Fatalf("open cache: %v", err)
 	}
 	passing := suiteForTest("example.com/m/pass")
-	summary := frontend.Summary{}
-	recordSuiteResult(resultCache, run.SuiteResult{
+	command := &testCommand{ctx: context.Background(), resultCache: resultCache}
+	command.recordSuiteResult(run.SuiteResult{
 		Package: passing.Package, Digest: passing.Digest, Completed: true,
 		Tests: []run.TestResult{{Name: "TestOK", Outcome: run.TestPassed}},
-	}, &summary)
-	if _, found := resultCache.Get(passing.Digest); !found {
+	})
+	if _, found := resultCache.Get(context.Background(), passing.Digest); !found {
 		t.Fatalf("passing suite must be cached")
 	}
-	recordSuiteResult(resultCache, run.SuiteResult{
+	command.recordSuiteResult(run.SuiteResult{
 		Package: passing.Package, Digest: passing.Digest, Completed: true, Failed: true,
 		Tests: []run.TestResult{{Name: "TestBad", Outcome: run.TestFailed}},
-	}, &summary)
-	if _, found := resultCache.Get(passing.Digest); found {
+	})
+	if _, found := resultCache.Get(context.Background(), passing.Digest); found {
 		t.Fatalf("failed suite must delete stale cache entry")
 	}
 }
@@ -501,10 +578,27 @@ func drainHasCachedEvent(events <-chan frontend.Event) bool {
 	return false
 }
 
+// cachedEventPaths drains cached events so tests can assert orchestration order.
+func cachedEventPaths(events <-chan frontend.Event) []string {
+	paths := []string{}
+	for len(events) > 0 {
+		event := <-events
+		if event.Kind == frontend.EventCached {
+			paths = append(paths, event.Cached.ImportPath)
+		}
+	}
+	return paths
+}
+
 // dispatchSuites sends suites and drains remaining runner results.
 func dispatchSuites(command *testCommand, suites []fingerprint.Suite) {
-	for _, suite := range suites {
-		command.processSuite(suite)
+	slots := command.startCacheLookupPrefetch(suites)
+	for index, suite := range suites {
+		lookup := cacheLookup{}
+		if slots != nil {
+			lookup = <-slots[index]
+		}
+		command.processSuite(suite, lookup)
 	}
 	command.closeTasks()
 	for command.resultsOpen {
@@ -743,17 +837,17 @@ func (p fakeTestProcess) Stderr() string {
 type memorySuiteCache struct{}
 
 // Get reports a cache miss.
-func (c *memorySuiteCache) Get(string) (cache.Entry, bool) {
+func (c *memorySuiteCache) Get(context.Context, string) (cache.Entry, bool) {
 	return cache.Entry{}, false
 }
 
 // Put accepts a cache write.
-func (c *memorySuiteCache) Put(string, cache.Entry) error {
+func (c *memorySuiteCache) Put(context.Context, string, cache.Entry) error {
 	return nil
 }
 
 // Delete accepts a cache delete.
-func (c *memorySuiteCache) Delete(string) {}
+func (c *memorySuiteCache) Delete(context.Context, string) {}
 
 // Run waits for cancellation and then succeeds.
 func (c *memorySuiteCache) Run(ctx context.Context) error {
@@ -792,27 +886,78 @@ type recordingSuiteCache struct {
 	deletes     int
 }
 
+// concurrentLookupCache blocks until several lookups overlap.
+type concurrentLookupCache struct {
+	memorySuiteCache
+	entries map[string]cache.Entry
+	delays  map[string]time.Duration
+	gate    chan struct{}
+	once    sync.Once
+	need    int32
+	seen    atomic.Int32
+}
+
+// newConcurrentLookupCache returns hits with earlier suites resolving later.
+func newConcurrentLookupCache(need int, suites []fingerprint.Suite) *concurrentLookupCache {
+	entries := make(map[string]cache.Entry, len(suites))
+	delays := make(map[string]time.Duration, len(suites))
+	for index, suite := range suites {
+		entries[suite.Digest] = cache.Entry{ImportPath: suite.Package.ImportPath, Passed: 1}
+		delays[suite.Digest] = time.Duration(len(suites)-index) * 10 * time.Millisecond
+	}
+	return &concurrentLookupCache{entries: entries, delays: delays, gate: make(chan struct{}), need: int32(need)}
+}
+
+// Get proves lookup overlap by opening the gate only after enough callers wait.
+func (c *concurrentLookupCache) Get(ctx context.Context, digest string) (cache.Entry, bool) {
+	if c.seen.Add(1) >= c.need {
+		c.once.Do(func() { close(c.gate) })
+	}
+	select {
+	case <-c.gate:
+	case <-ctx.Done():
+		return cache.Entry{}, false
+	}
+	time.Sleep(c.delays[digest])
+	entry, found := c.entries[digest]
+	return entry, found
+}
+
+// interruptLookupCache waits on ctx to prove prefetch cancellation is threaded.
+type interruptLookupCache struct {
+	memorySuiteCache
+	started chan struct{}
+	once    sync.Once
+}
+
+// Get blocks like a remote request and returns a miss once ctx is cancelled.
+func (c *interruptLookupCache) Get(ctx context.Context, _ string) (cache.Entry, bool) {
+	c.once.Do(func() { close(c.started) })
+	<-ctx.Done()
+	return cache.Entry{}, false
+}
+
 // newRecordingSuiteCache returns a cache seeded with one digest entry.
 func newRecordingSuiteCache(digest string, entry cache.Entry) *recordingSuiteCache {
 	return &recordingSuiteCache{entries: map[string]cache.Entry{digest: entry}}
 }
 
 // Get records a cache lookup and returns any seeded entry.
-func (c *recordingSuiteCache) Get(digest string) (cache.Entry, bool) {
+func (c *recordingSuiteCache) Get(_ context.Context, digest string) (cache.Entry, bool) {
 	c.gets++
 	entry, found := c.entries[digest]
 	return entry, found
 }
 
 // Put records a cache write and refreshes the digest entry.
-func (c *recordingSuiteCache) Put(digest string, entry cache.Entry) error {
+func (c *recordingSuiteCache) Put(_ context.Context, digest string, entry cache.Entry) error {
 	c.puts++
 	c.entries[digest] = entry
 	return nil
 }
 
 // Delete records a cache delete and removes the digest entry.
-func (c *recordingSuiteCache) Delete(digest string) {
+func (c *recordingSuiteCache) Delete(_ context.Context, digest string) {
 	c.deletes++
 	delete(c.entries, digest)
 }

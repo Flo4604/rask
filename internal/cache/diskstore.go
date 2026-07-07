@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -68,7 +69,11 @@ func newDiskStore(rootDir string) (*diskStore, error) {
 }
 
 // Get returns the object body and true, or nil and false when the object is absent.
-func (s *diskStore) Get(key string) ([]byte, bool, error) {
+//
+// The context is ignored because these local file operations are microsecond
+// scale and not meaningfully cancellable through the os package; it exists so
+// the tiered store can pass one cancellation-aware contract to every tier.
+func (s *diskStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 	body, err := os.ReadFile(s.keyPath(key))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -80,7 +85,10 @@ func (s *diskStore) Get(key string) ([]byte, bool, error) {
 }
 
 // Put writes body to key through a temporary file followed by rename.
-func (s *diskStore) Put(key string, body []byte) error {
+//
+// The context is ignored because local write-then-rename has no useful
+// cancellation seam and should remain atomic once started.
+func (s *diskStore) Put(_ context.Context, key string, body []byte) error {
 	path := s.keyPath(key)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("creating object dir: %w", err)
@@ -96,7 +104,10 @@ func (s *diskStore) Put(key string, body []byte) error {
 }
 
 // Delete validates rask ownership before removing key and treats a miss as success.
-func (s *diskStore) Delete(key string) error {
+//
+// The context is ignored because local deletion is bounded by one filesystem
+// operation after the ownership proof has been read.
+func (s *diskStore) Delete(_ context.Context, key string) error {
 	if err := validateOwnTag(s.rootDir); err != nil {
 		return fmt.Errorf("refusing object delete: %w", err)
 	}
@@ -108,7 +119,10 @@ func (s *diskStore) Delete(key string) error {
 }
 
 // Touch updates key's modification time to mark it recently used.
-func (s *diskStore) Touch(key string) error {
+//
+// The context is ignored because updating local timestamps has no cancellable
+// syscall boundary exposed by the standard library.
+func (s *diskStore) Touch(_ context.Context, key string) error {
 	now := time.Now()
 	if err := os.Chtimes(s.keyPath(key), now, now); err != nil {
 		return fmt.Errorf("touching object %s: %w", key, err)

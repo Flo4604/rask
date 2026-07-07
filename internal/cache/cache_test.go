@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -16,32 +17,32 @@ func TestCachePolicy(t *testing.T) {
 	cacheB := openCacheAt(t, rootDir, "example.com/m")
 	cacheOther := openCacheAt(t, rootDir, "example.com/other")
 	digest := digestForTest("a")
-	if err := cacheA.Put(digest, entryForTest()); err != nil {
+	if err := cacheA.Put(context.Background(), digest, entryForTest()); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if _, found := cacheB.Get(digest); !found {
+	if _, found := cacheB.Get(context.Background(), digest); !found {
 		t.Fatalf("same module shard must share entries")
 	}
-	if err := cacheOther.Put(digest, entryForTest()); err != nil {
+	if err := cacheOther.Put(context.Background(), digest, entryForTest()); err != nil {
 		t.Fatalf("put other: %v", err)
 	}
-	cacheA.Delete(digest)
-	if _, found := cacheB.Get(digest); found {
+	cacheA.Delete(context.Background(), digest)
+	if _, found := cacheB.Get(context.Background(), digest); found {
 		t.Fatalf("failed suites must delete stale entries")
 	}
-	if _, found := cacheOther.Get(digest); !found {
+	if _, found := cacheOther.Get(context.Background(), digest); !found {
 		t.Fatalf("other module shard must remain")
 	}
-	if err := cacheA.Put(digest, entryForTest()); err != nil {
+	if err := cacheA.Put(context.Background(), digest, entryForTest()); err != nil {
 		t.Fatalf("put again: %v", err)
 	}
 	if err := cacheA.RemoveModule(); err != nil {
 		t.Fatalf("remove module: %v", err)
 	}
-	if _, found := cacheB.Get(digest); found {
+	if _, found := cacheB.Get(context.Background(), digest); found {
 		t.Fatalf("module-scoped clean must remove the module shard")
 	}
-	if _, found := cacheOther.Get(digest); !found {
+	if _, found := cacheOther.Get(context.Background(), digest); !found {
 		t.Fatalf("module-scoped clean must leave other modules alone")
 	}
 }
@@ -57,13 +58,13 @@ func TestCacheSelfHealsPrunesAndReadBackMissIsError(t *testing.T) {
 	if err := os.WriteFile(path, []byte("garbage"), 0o644); err != nil {
 		t.Fatalf("write corrupt: %v", err)
 	}
-	if _, found := resultCache.Get(digest); found {
+	if _, found := resultCache.Get(context.Background(), digest); found {
 		t.Fatalf("corrupt object must miss")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("corrupt object must be deleted")
 	}
-	if err := newResultCache(&disappearingStore{}, "example.com/m").Put(digest, entryForTest()); err == nil {
+	if err := newResultCache(&disappearingStore{}, "example.com/m").Put(context.Background(), digest, entryForTest()); err == nil {
 		t.Fatalf("read-back miss must be an error")
 	}
 }
@@ -137,7 +138,7 @@ func TestDiskStoreCleanRefusesTagRemovedAfterOpen(t *testing.T) {
 	rootDir := t.TempDir()
 	resultCache := openCacheAt(t, rootDir, "example.com/m")
 	digest := digestForTest("c")
-	if err := resultCache.Put(digest, entryForTest()); err != nil {
+	if err := resultCache.Put(context.Background(), digest, entryForTest()); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	store := resultCache.store.(*diskStore)
@@ -259,22 +260,22 @@ func assertMissing(t *testing.T, path string) {
 type disappearingStore struct{}
 
 // Get always reports a missing object.
-func (s *disappearingStore) Get(string) ([]byte, bool, error) {
+func (s *disappearingStore) Get(context.Context, string) ([]byte, bool, error) {
 	return nil, false, nil
 }
 
 // Put accepts writes without retaining them.
-func (s *disappearingStore) Put(string, []byte) error {
+func (s *disappearingStore) Put(context.Context, string, []byte) error {
 	return nil
 }
 
 // Delete accepts deletes without retaining state.
-func (s *disappearingStore) Delete(string) error {
+func (s *disappearingStore) Delete(context.Context, string) error {
 	return nil
 }
 
 // Touch accepts touches without retaining state.
-func (s *disappearingStore) Touch(string) error {
+func (s *disappearingStore) Touch(context.Context, string) error {
 	return nil
 }
 

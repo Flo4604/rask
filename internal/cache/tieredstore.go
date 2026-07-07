@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -17,9 +18,9 @@ type tieredStore struct {
 }
 
 type remoteStore interface {
-	Get(key string) ([]byte, bool, error)
-	Put(key string, body []byte) error
-	Delete(key string) error
+	Get(ctx context.Context, key string) ([]byte, bool, error)
+	Put(ctx context.Context, key string, body []byte) error
+	Delete(ctx context.Context, key string) error
 }
 
 // newTieredStore returns a disk-near, remote-far object store.
@@ -29,12 +30,12 @@ func newTieredStore(disk objectStore, remote remoteStore) *tieredStore {
 
 // Get checks disk first, then remote; remote hits are staged for backfill once
 // Cache validates the body and calls Touch.
-func (s *tieredStore) Get(key string) ([]byte, bool, error) {
-	body, found, _ := s.disk.Get(key)
+func (s *tieredStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
+	body, found, _ := s.disk.Get(ctx, key)
 	if found {
 		return body, true, nil
 	}
-	body, found, err := s.remote.Get(key)
+	body, found, err := s.remote.Get(ctx, key)
 	if err != nil || !found {
 		return nil, false, nil
 	}
@@ -43,34 +44,34 @@ func (s *tieredStore) Get(key string) ([]byte, bool, error) {
 }
 
 // Put writes and verifies disk through Cache, then best-effort writes remote.
-func (s *tieredStore) Put(key string, body []byte) error {
-	if err := s.disk.Put(key, body); err != nil {
+func (s *tieredStore) Put(ctx context.Context, key string, body []byte) error {
+	if err := s.disk.Put(ctx, key, body); err != nil {
 		return err
 	}
-	if err := s.remote.Put(key, body); err == nil {
+	if err := s.remote.Put(ctx, key, body); err == nil {
 		s.remoteWrites.Add(1)
 	}
 	return nil
 }
 
 // Delete removes disk and asks the remote tier to evict without surfacing errors.
-func (s *tieredStore) Delete(key string) error {
-	err := s.disk.Delete(key)
-	_ = s.remote.Delete(key)
+func (s *tieredStore) Delete(ctx context.Context, key string) error {
+	err := s.disk.Delete(ctx, key)
+	_ = s.remote.Delete(ctx, key)
 	s.pending.Delete(key)
 	return err
 }
 
 // Touch marks local hits as recently used and backfills validated remote hits.
-func (s *tieredStore) Touch(key string) error {
+func (s *tieredStore) Touch(ctx context.Context, key string) error {
 	if body, ok := s.pending.LoadAndDelete(key); ok {
 		if cached, ok := body.([]byte); ok {
-			_ = s.disk.Put(key, cached)
+			_ = s.disk.Put(ctx, key, cached)
 		}
 		s.remoteReads.Add(1)
 		return nil
 	}
-	return s.disk.Touch(key)
+	return s.disk.Touch(ctx, key)
 }
 
 // RemoteStats returns successful remote read and write counters.

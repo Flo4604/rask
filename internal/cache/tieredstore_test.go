@@ -1,14 +1,24 @@
 package cache
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	appconfig "github.com/chronark/rask/internal/config"
+)
+
+const (
+	// tieredCancelDelayForTest gives the remote lookup time to park on ctx.Done.
+	tieredCancelDelayForTest = 50 * time.Millisecond
+
+	// tieredCancelledGetMax proves tiered Get returns on context cancellation.
+	tieredCancelledGetMax = 500 * time.Millisecond
 )
 
 // TestOpenObjectStoreConfig protects always-on disk and bucket opt-in startup.
@@ -56,11 +66,11 @@ func TestOpenObjectStoreConfig(t *testing.T) {
 func TestTieredStoreGetSemantics(t *testing.T) {
 	local, remote, requests := newTieredCacheForTest(t)
 	localDigest := digestForTest("1")
-	if err := newResultCache(local, "example.com/m").Put(localDigest, entryForTest()); err != nil {
+	if err := newResultCache(local, "example.com/m").Put(context.Background(), localDigest, entryForTest()); err != nil {
 		t.Fatalf("seed local: %v", err)
 	}
 	requests.Reset()
-	if _, found := newResultCache(newTieredStore(local, remote), "example.com/m").Get(localDigest); !found {
+	if _, found := newResultCache(newTieredStore(local, remote), "example.com/m").Get(context.Background(), localDigest); !found {
 		t.Fatalf("local object must hit")
 	}
 	if requests.Total() != 0 {
@@ -75,13 +85,13 @@ func TestTieredStorePutAndDelete(t *testing.T) {
 	local, remote, requests := newTieredCacheForTest(t)
 	resultCache := newResultCache(newTieredStore(local, remote), "example.com/m")
 	digest := digestForTest("4")
-	if err := resultCache.Put(digest, entryForTest()); err != nil {
+	if err := resultCache.Put(context.Background(), digest, entryForTest()); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	assertCacheHit(t, newResultCache(local, "example.com/m"), digest)
 	assertRemoteHit(t, remote, resultCache.objectKey(digest))
 	requests.Reset()
-	resultCache.Delete(digest)
+	resultCache.Delete(context.Background(), digest)
 	assertCacheMiss(t, newResultCache(local, "example.com/m"), digest)
 	assertRemoteMiss(t, remote, resultCache.objectKey(digest))
 	if requests.Count(http.MethodDelete) != 1 {
@@ -96,12 +106,12 @@ func TestTieredStoreRemoteStats(t *testing.T) {
 	resultCache := newResultCache(store, "example.com/m")
 	remoteDigest := digestForTest("8")
 	key := objectKeyForParts(moduleKeyForPath("example.com/m"), remoteDigest)
-	if err := remote.Put(key, entryJSONForTest(t)); err != nil {
+	if err := remote.Put(context.Background(), key, entryJSONForTest(t)); err != nil {
 		t.Fatalf("seed remote: %v", err)
 	}
 	assertCacheHit(t, resultCache, remoteDigest)
 	assertCacheMiss(t, resultCache, digestForTest("9"))
-	if err := resultCache.Put(digestForTest("a"), entryForTest()); err != nil {
+	if err := resultCache.Put(context.Background(), digestForTest("a"), entryForTest()); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	assertRemoteStats(t, store, 1, 1)
@@ -115,7 +125,7 @@ func TestTieredStoreRemoteStatsIgnoreFailedPuts(t *testing.T) {
 	}
 	store := newTieredStore(local, &failingRemoteStore{putErr: errors.New("refused")})
 	resultCache := newResultCache(store, "example.com/m")
-	if err := resultCache.Put(digestForTest("b"), entryForTest()); err != nil {
+	if err := resultCache.Put(context.Background(), digestForTest("b"), entryForTest()); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	assertRemoteStats(t, store, 0, 0)
@@ -131,7 +141,7 @@ func TestTieredStoreRemoteStatsConcurrentPuts(t *testing.T) {
 	for index := range puts {
 		digest := fmt.Sprintf("%064x", index+32)
 		wg.Go(func() {
-			if err := resultCache.Put(digest, entryForTest()); err != nil {
+			if err := resultCache.Put(context.Background(), digest, entryForTest()); err != nil {
 				t.Errorf("put %s: %v", digest, err)
 			}
 		})
@@ -154,11 +164,31 @@ func TestTieredStoreRemoteFailuresMatchDisk(t *testing.T) {
 	}
 }
 
+// TestTieredStoreRemoteGetHonorsContextCancellation protects interrupted misses.
+func TestTieredStoreRemoteGetHonorsContextCancellation(t *testing.T) {
+	local, err := newDiskStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("local store: %v", err)
+	}
+	resultCache := newResultCache(newTieredStore(local, blockingRemoteStore{}), "example.com/m")
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(tieredCancelDelayForTest, cancel)
+	startedAt := time.Now()
+	_, found := resultCache.Get(ctx, digestForTest("d"))
+	elapsed := time.Since(startedAt)
+	if found {
+		t.Fatalf("cancelled remote Get must report a miss")
+	}
+	if elapsed > tieredCancelledGetMax {
+		t.Fatalf("cancelled tiered Get took %s, want under %s", elapsed, tieredCancelledGetMax)
+	}
+}
+
 func assertRemoteBackfill(t *testing.T, local *diskStore, remote *memoryRemoteStore, requests *requestCounts) {
 	t.Helper()
 	remoteDigest := digestForTest("2")
 	key := objectKeyForParts(moduleKeyForPath("example.com/m"), remoteDigest)
-	if err := remote.Put(key, entryJSONForTest(t)); err != nil {
+	if err := remote.Put(context.Background(), key, entryJSONForTest(t)); err != nil {
 		t.Fatalf("seed remote: %v", err)
 	}
 	requests.Reset()
@@ -185,10 +215,10 @@ func assertTieredMiss(t *testing.T, local *diskStore, remote *memoryRemoteStore,
 func runCacheMatrix(t *testing.T, diskOnly *Cache, tiered *Cache) {
 	t.Helper()
 	hitDigest := digestForTest("5")
-	if err := diskOnly.Put(hitDigest, entryForTest()); err != nil {
+	if err := diskOnly.Put(context.Background(), hitDigest, entryForTest()); err != nil {
 		t.Fatalf("seed disk only: %v", err)
 	}
-	if err := tiered.store.Put(tiered.objectKey(hitDigest), entryJSONForTest(t)); err != nil {
+	if err := tiered.store.Put(context.Background(), tiered.objectKey(hitDigest), entryJSONForTest(t)); err != nil {
 		t.Fatalf("seed tiered disk: %v", err)
 	}
 	assertSameGet(t, diskOnly, tiered, hitDigest)
@@ -199,8 +229,8 @@ func runCacheMatrix(t *testing.T, diskOnly *Cache, tiered *Cache) {
 
 func assertSameGet(t *testing.T, left *Cache, right *Cache, digest string) {
 	t.Helper()
-	leftEntry, leftFound := left.Get(digest)
-	rightEntry, rightFound := right.Get(digest)
+	leftEntry, leftFound := left.Get(context.Background(), digest)
+	rightEntry, rightFound := right.Get(context.Background(), digest)
 	if leftFound != rightFound || leftEntry.Passed != rightEntry.Passed {
 		t.Fatalf("Get parity found=(%v,%v) passed=(%d,%d)",
 			leftFound, rightFound, leftEntry.Passed, rightEntry.Passed)
@@ -209,8 +239,8 @@ func assertSameGet(t *testing.T, left *Cache, right *Cache, digest string) {
 
 func assertSamePut(t *testing.T, left *Cache, right *Cache, digest string) {
 	t.Helper()
-	leftErr := left.Put(digest, entryForTest())
-	rightErr := right.Put(digest, entryForTest())
+	leftErr := left.Put(context.Background(), digest, entryForTest())
+	rightErr := right.Put(context.Background(), digest, entryForTest())
 	if (leftErr == nil) != (rightErr == nil) {
 		t.Fatalf("Put parity left=%v right=%v", leftErr, rightErr)
 	}
@@ -219,8 +249,8 @@ func assertSamePut(t *testing.T, left *Cache, right *Cache, digest string) {
 
 func assertSameDelete(t *testing.T, left *Cache, right *Cache, digest string) {
 	t.Helper()
-	left.Delete(digest)
-	right.Delete(digest)
+	left.Delete(context.Background(), digest)
+	right.Delete(context.Background(), digest)
 	assertSameGet(t, left, right, digest)
 }
 
@@ -237,28 +267,28 @@ func newTieredCacheForTest(t *testing.T) (*diskStore, *memoryRemoteStore, *reque
 
 func assertCacheHit(t *testing.T, resultCache *Cache, digest string) {
 	t.Helper()
-	if _, found := resultCache.Get(digest); !found {
+	if _, found := resultCache.Get(context.Background(), digest); !found {
 		t.Fatalf("%s must hit", digest)
 	}
 }
 
 func assertCacheMiss(t *testing.T, resultCache *Cache, digest string) {
 	t.Helper()
-	if _, found := resultCache.Get(digest); found {
+	if _, found := resultCache.Get(context.Background(), digest); found {
 		t.Fatalf("%s must miss", digest)
 	}
 }
 
 func assertRemoteHit(t *testing.T, remote remoteStore, key string) {
 	t.Helper()
-	if _, found, err := remote.Get(key); err != nil || !found {
+	if _, found, err := remote.Get(context.Background(), key); err != nil || !found {
 		t.Fatalf("%s remote hit = %v err %v, want hit", key, found, err)
 	}
 }
 
 func assertRemoteMiss(t *testing.T, remote remoteStore, key string) {
 	t.Helper()
-	if _, found, err := remote.Get(key); err != nil || found {
+	if _, found, err := remote.Get(context.Background(), key); err != nil || found {
 		t.Fatalf("%s remote hit = %v err %v, want miss", key, found, err)
 	}
 }
@@ -312,7 +342,7 @@ type memoryRemoteStore struct {
 	requests *requestCounts
 }
 
-func (s *memoryRemoteStore) Get(key string) ([]byte, bool, error) {
+func (s *memoryRemoteStore) Get(_ context.Context, key string) ([]byte, bool, error) {
 	s.requests.Add(http.MethodGet)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -320,7 +350,7 @@ func (s *memoryRemoteStore) Get(key string) ([]byte, bool, error) {
 	return append([]byte(nil), body...), found, nil
 }
 
-func (s *memoryRemoteStore) Put(key string, body []byte) error {
+func (s *memoryRemoteStore) Put(_ context.Context, key string, body []byte) error {
 	s.requests.Add(http.MethodPut)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,7 +361,7 @@ func (s *memoryRemoteStore) Put(key string, body []byte) error {
 	return nil
 }
 
-func (s *memoryRemoteStore) Delete(key string) error {
+func (s *memoryRemoteStore) Delete(_ context.Context, key string) error {
 	s.requests.Add(http.MethodDelete)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -344,15 +374,34 @@ type failingRemoteStore struct {
 	putErr error
 }
 
-func (s *failingRemoteStore) Get(string) ([]byte, bool, error) {
+// blockingRemoteStore simulates a remote request that only ctx can interrupt.
+type blockingRemoteStore struct{}
+
+// Get waits on ctx so tieredStore must pass cancellation to remote reads.
+func (s blockingRemoteStore) Get(ctx context.Context, _ string) ([]byte, bool, error) {
+	<-ctx.Done()
+	return nil, false, ctx.Err()
+}
+
+// Put is unused because this fake exists only for read cancellation.
+func (s blockingRemoteStore) Put(context.Context, string, []byte) error {
+	return nil
+}
+
+// Delete is unused because this fake exists only for read cancellation.
+func (s blockingRemoteStore) Delete(context.Context, string) error {
+	return nil
+}
+
+func (s *failingRemoteStore) Get(context.Context, string) ([]byte, bool, error) {
 	return nil, false, s.getErr
 }
 
-func (s *failingRemoteStore) Put(string, []byte) error {
+func (s *failingRemoteStore) Put(context.Context, string, []byte) error {
 	return s.putErr
 }
 
-func (s *failingRemoteStore) Delete(string) error {
+func (s *failingRemoteStore) Delete(context.Context, string) error {
 	return nil
 }
 

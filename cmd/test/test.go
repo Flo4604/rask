@@ -36,6 +36,14 @@ const (
 
 	// eventChannelCapacity bounds orchestration-to-frontend buffering.
 	eventChannelCapacity = setup.EventChannelCapacity
+
+	// cacheLookupSlotCapacity lets one worker publish without depending on
+	// orchestration order, which keeps early exits from stranding goroutines.
+	cacheLookupSlotCapacity = 1
+
+	// cacheLookupWorkerCount collapses I/O-bound remote round trips toward
+	// N/16*RTT without stampeding the shared cache tier.
+	cacheLookupWorkerCount = 16
 )
 
 const (
@@ -112,12 +120,18 @@ type testArguments struct {
 
 // suiteCache is the cache behavior the test command needs for suites.
 type suiteCache interface {
-	Get(digest string) (cache.Entry, bool)
-	Put(digest string, entry cache.Entry) error
-	Delete(digest string)
+	Get(ctx context.Context, digest string) (cache.Entry, bool)
+	Put(ctx context.Context, digest string, entry cache.Entry) error
+	Delete(ctx context.Context, digest string)
 	Run(ctx context.Context) error
 	HasRemoteTier() bool
 	RemoteStats() cache.RemoteStats
+}
+
+// cacheLookup carries a completed lookup so orchestration remains ordered.
+type cacheLookup struct {
+	entry cache.Entry
+	found bool
 }
 
 // Action parses package patterns and starts the service graph.
@@ -383,8 +397,13 @@ func (c *testCommand) sendRunPlan(suites []fingerprint.Suite) {
 
 // dispatchPlannedSuites partitions planned suites and drains runner results.
 func (c *testCommand) dispatchPlannedSuites(suites []fingerprint.Suite) {
-	for _, suite := range suites {
-		c.processSuite(suite)
+	slots := c.startCacheLookupPrefetch(suites)
+	for index, suite := range suites {
+		lookup := cacheLookup{}
+		if slots != nil {
+			lookup = <-slots[index]
+		}
+		c.processSuite(suite, lookup)
 	}
 	c.closeTasks()
 	for c.resultsOpen {
@@ -403,16 +422,13 @@ func (c *testCommand) handleRunnerReceive(ok bool, event run.Event) bool {
 }
 
 // processSuite partitions one suite through cache and runner policy.
-func (c *testCommand) processSuite(suite fingerprint.Suite) {
-	if !c.noCache {
-		entry, found := c.resultCache.Get(suite.Digest)
-		if found {
-			c.summary.Cached++
-			c.summary.Passed += entry.Passed
-			c.summary.Ignored += entry.Ignored
-			c.sendCached(suite, entry)
-			return
-		}
+func (c *testCommand) processSuite(suite fingerprint.Suite, lookup cacheLookup) {
+	if lookup.found {
+		c.summary.Cached++
+		c.summary.Passed += lookup.entry.Passed
+		c.summary.Ignored += lookup.entry.Ignored
+		c.sendCached(suite, lookup.entry)
+		return
 	}
 	if c.failFast || c.tasksClosed {
 		c.staleDropped++
@@ -423,6 +439,41 @@ func (c *testCommand) processSuite(suite fingerprint.Suite) {
 		return
 	}
 	c.staleSent++
+}
+
+// startCacheLookupPrefetch starts bounded remote I/O after planning is fixed.
+func (c *testCommand) startCacheLookupPrefetch(suites []fingerprint.Suite) []chan cacheLookup {
+	if c.noCache {
+		return nil
+	}
+	slots := make([]chan cacheLookup, len(suites))
+	indexes := make(chan int, len(suites))
+	for index := range suites {
+		slots[index] = make(chan cacheLookup, cacheLookupSlotCapacity)
+		indexes <- index
+	}
+	close(indexes)
+	workers := min(cacheLookupWorkerCount, len(suites))
+	for range workers {
+		go c.runCacheLookupWorker(suites, indexes, slots)
+	}
+	return slots
+}
+
+// runCacheLookupWorker owns cache reads while orchestration owns counters.
+func (c *testCommand) runCacheLookupWorker(
+	suites []fingerprint.Suite,
+	indexes <-chan int,
+	slots []chan cacheLookup,
+) {
+	for index := range indexes {
+		lookup := cacheLookup{}
+		if c.runCtx.Err() == nil {
+			entry, found := c.resultCache.Get(c.runCtx, suites[index].Digest)
+			lookup = cacheLookup{entry: entry, found: found}
+		}
+		slots[index] <- lookup
+	}
 }
 
 // handleRunnerEvent forwards runner notifications and applies fail-fast.
@@ -450,7 +501,7 @@ func (c *testCommand) handleRunnerEvent(event run.Event) {
 	}
 	result := event.Result
 	c.staleResults++
-	recordSuiteResult(c.resultCache, result, &c.summary)
+	c.recordSuiteResult(result)
 	if !result.Killed {
 		c.sendFrontend(frontend.Event{Kind: frontend.EventSuiteResult, SuiteResult: frontendSuiteResult(result)})
 	}
@@ -562,29 +613,31 @@ func serviceFailure(errorsByService []error, failFast bool) error {
 	return nil
 }
 
-// recordSuiteResult updates the summary and cache for one terminal suite result.
-// Only passing suites are cached; failing suites evict any stale entry.
-func recordSuiteResult(resultCache suiteCache, suite run.SuiteResult, summary *frontend.Summary) {
-	assert.NotNil(resultCache)
+// recordSuiteResult keeps runner effects on the orchestration goroutine.
+//
+// Passing writes use the root context so fail-fast cancellation does not abort
+// a result that had already arrived before the first failure.
+func (c *testCommand) recordSuiteResult(suite run.SuiteResult) {
+	assert.NotNil(c.resultCache)
 	if suite.Killed {
-		summary.Skipped++
+		c.summary.Skipped++
 		return
 	}
 	passed, failed, ignored := countRunnerTests(suite.Tests)
-	summary.Passed += passed
-	summary.Failed += failed
-	summary.Ignored += ignored
+	c.summary.Passed += passed
+	c.summary.Failed += failed
+	c.summary.Ignored += ignored
 	if suite.Failed {
-		summary.FailedSuites = append(summary.FailedSuites, suite.Package.ImportPath)
-		resultCache.Delete(suite.Digest)
+		c.summary.FailedSuites = append(c.summary.FailedSuites, suite.Package.ImportPath)
+		c.resultCache.Delete(c.ctx, suite.Digest)
 		return
 	}
 	entry := cache.Entry{
 		ImportPath: suite.Package.ImportPath, Passed: passed, Ignored: ignored,
 		ElapsedSeconds: suite.ElapsedSeconds, CreatedAt: time.Now(),
 	}
-	if err := resultCache.Put(suite.Digest, entry); err != nil {
-		summary.CacheErrors++
+	if err := c.resultCache.Put(c.ctx, suite.Digest, entry); err != nil {
+		c.summary.CacheErrors++
 	}
 }
 

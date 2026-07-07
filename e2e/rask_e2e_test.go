@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +10,20 @@ import (
 	"strings"
 	"testing"
 	"time"
+)
+
+const (
+	// interruptPackageCount keeps enough cold-cache misses to expose serial I/O.
+	interruptPackageCount = 10
+
+	// interruptRemoteDelay is long enough for sequential misses to dominate exit.
+	interruptRemoteDelay = 500 * time.Millisecond
+
+	// interruptSignalDelay lets the binary reach cache dispatch before SIGINT.
+	interruptSignalDelay = time.Second
+
+	// interruptExitMax leaves CI slack while still catching sequential remote waits.
+	interruptExitMax = 4 * time.Second
 )
 
 func TestColdThenWarm(t *testing.T) {
@@ -128,6 +144,42 @@ func TestTieredExternalS3(t *testing.T) {
 	}, func() {})
 }
 
+// TestInterruptDuringSlowRemoteCacheLookups protects user-visible SIGINT latency.
+func TestInterruptDuringSlowRemoteCacheLookups(t *testing.T) {
+	module := scaffoldModule(t, interruptPackages()...)
+	remoteEnv, _ := startDelayedFakeS3(t, interruptRemoteDelay)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, raskBinary, "./...")
+	command.Dir = module.dir
+	command.Env = baseEnv(envWithCache(t.TempDir(), remoteEnv))
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		t.Fatalf("start rask: %v", err)
+	}
+	time.Sleep(interruptSignalDelay)
+	startedAt := time.Now()
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatalf("signal rask: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+	err := command.Wait()
+	elapsed := time.Since(startedAt)
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("rask timed out\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	exit, ok := err.(*exec.ExitError)
+	if !ok || exit.ExitCode() != 130 {
+		t.Fatalf("exit=%v err=%v, want 130\nstdout:\n%s\nstderr:\n%s",
+			exitCodeForError(err), err, stdout.String(), stderr.String())
+	}
+	if elapsed > interruptExitMax {
+		t.Fatalf("SIGINT exit took %s, want under %s\nstdout:\n%s\nstderr:\n%s",
+			elapsed, interruptExitMax, stdout.String(), stderr.String())
+	}
+}
+
 func externalS3Env(bucket string) map[string]string {
 	env := map[string]string{
 		"RASK_REMOTE_CACHE_BUCKET":            bucket,
@@ -136,6 +188,24 @@ func externalS3Env(bucket string) map[string]string {
 	}
 	copyE2ES3Env(env, "PREFIX", "ENDPOINT", "REGION")
 	return env
+}
+
+// interruptPackages creates enough independent misses to expose serial remotes.
+func interruptPackages() []packageSpec {
+	packages := make([]packageSpec, 0, interruptPackageCount)
+	for index := range interruptPackageCount {
+		packages = append(packages, packageSpec{name: fmt.Sprintf("pkg%02d", index), test: testPass})
+	}
+	return packages
+}
+
+// exitCodeForError keeps failure output useful when Wait returns a different error.
+func exitCodeForError(err error) int {
+	exit, ok := err.(*exec.ExitError)
+	if !ok {
+		return -1
+	}
+	return exit.ExitCode()
 }
 
 func assertTieredScenario(

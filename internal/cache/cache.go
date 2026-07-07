@@ -104,9 +104,9 @@ func (c *Cache) Run(ctx context.Context) error {
 // Read errors, missing objects, oversized bodies, corrupt JSON, and invalid
 // entries all behave as misses. Corrupt and invalid objects are deleted so
 // future reads can heal without caller involvement.
-func (c *Cache) Get(digest string) (Entry, bool) {
+func (c *Cache) Get(ctx context.Context, digest string) (Entry, bool) {
 	key := c.objectKey(digest)
-	body, found, err := c.store.Get(key)
+	body, found, err := c.store.Get(ctx, key)
 	if err != nil || !found {
 		return Entry{}, false
 	}
@@ -115,10 +115,10 @@ func (c *Cache) Get(digest string) (Entry, bool) {
 		json.Unmarshal(body, &entry) != nil ||
 		!entryValid(entry)
 	if corrupt {
-		c.Delete(digest)
+		c.Delete(ctx, digest)
 		return Entry{}, false
 	}
-	_ = c.store.Touch(key)
+	_ = c.store.Touch(ctx, key)
 	return entry, true
 }
 
@@ -127,15 +127,15 @@ func (c *Cache) Get(digest string) (Entry, bool) {
 // A missing read-back is returned as an error because a concurrent clean is an
 // external race. Treating it as success would let callers believe a result was
 // cached when it was already removed.
-func (c *Cache) Put(digest string, entry Entry) error {
+func (c *Cache) Put(ctx context.Context, digest string, entry Entry) error {
 	assert.True(entryValid(entry))
 	body, err := json.Marshal(entry)
 	assert.NoError(err)
 	assert.LessOrEqual(len(body), objectBytesMax)
-	if err := c.store.Put(c.objectKey(digest), body); err != nil {
+	if err := c.store.Put(ctx, c.objectKey(digest), body); err != nil {
 		return err
 	}
-	stored, found := c.Get(digest)
+	stored, found := c.Get(ctx, digest)
 	if !found {
 		return fmt.Errorf("cache object disappeared during write verification")
 	}
@@ -145,8 +145,8 @@ func (c *Cache) Put(digest string, entry Entry) error {
 }
 
 // Delete removes the object for digest and ignores deletion errors.
-func (c *Cache) Delete(digest string) {
-	_ = c.store.Delete(c.objectKey(digest))
+func (c *Cache) Delete(ctx context.Context, digest string) {
+	_ = c.store.Delete(ctx, c.objectKey(digest))
 }
 
 // RemoveModule re-validates rask's two-line CACHEDIR.TAG immediately before
@@ -204,13 +204,13 @@ func CleanAll(diskDir string) error {
 // store is the minimal storage contract used by cache pruning and test fakes.
 type store interface {
 	// Get returns a copied body, whether the key was found, and storage errors.
-	Get(key string) ([]byte, bool, error)
+	Get(ctx context.Context, key string) ([]byte, bool, error)
 
 	// Put stores body at key.
-	Put(key string, body []byte) error
+	Put(ctx context.Context, key string, body []byte) error
 
 	// Delete removes key and should treat a missing object as success.
-	Delete(key string) error
+	Delete(ctx context.Context, key string) error
 
 	// List returns objects under prefix with last-used timestamps.
 	List(prefix string) ([]storedObject, error)
@@ -221,7 +221,7 @@ type objectStore interface {
 	store
 
 	// Touch updates key's last-used timestamp.
-	Touch(key string) error
+	Touch(ctx context.Context, key string) error
 
 	// RemovePrefix removes every object under prefix.
 	RemovePrefix(prefix string) error
@@ -283,7 +283,7 @@ func pruneStoreByAge(store store, objects []storedObject, cutoff time.Time) []st
 	for _, object := range objects {
 		if temporaryObject(object.Key) {
 			if object.LastUsedAt.Before(cutoff) {
-				_ = store.Delete(object.Key)
+				_ = store.Delete(context.Background(), object.Key)
 			}
 			continue
 		}
@@ -291,7 +291,7 @@ func pruneStoreByAge(store store, objects []storedObject, cutoff time.Time) []st
 			continue
 		}
 		if object.LastUsedAt.Before(cutoff) {
-			_ = store.Delete(object.Key)
+			_ = store.Delete(context.Background(), object.Key)
 			continue
 		}
 		kept = append(kept, object)
@@ -308,7 +308,7 @@ func pruneStoreByCount(store store, objects []storedObject, countMax int) {
 		return objects[a].LastUsedAt.Before(objects[b].LastUsedAt)
 	})
 	for _, object := range objects[:len(objects)-countMax] {
-		_ = store.Delete(object.Key)
+		_ = store.Delete(context.Background(), object.Key)
 	}
 }
 

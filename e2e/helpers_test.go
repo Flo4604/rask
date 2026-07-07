@@ -254,6 +254,32 @@ func startFakeS3(t *testing.T) (map[string]string, func()) {
 	return env, stop
 }
 
+// startDelayedFakeS3 isolates interrupt-latency tests from normal fake S3 speed.
+func startDelayedFakeS3(t *testing.T, delay time.Duration) (map[string]string, func()) {
+	t.Helper()
+	listener := loopbackListener(t)
+	server := httptest.NewUnstartedServer(delayedHandler(fakeS3Handler("fake-access"), delay))
+	server.Listener = listener
+	server.Start()
+	env := s3Env("rask-e2e", "prefix", server.URL, "fake-access", "fake-secret")
+	stop := server.Close
+	t.Cleanup(stop)
+	return env, stop
+}
+
+// delayedHandler adds deterministic remote latency without changing S3 semantics.
+func delayedHandler(next http.Handler, delay time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			next.ServeHTTP(w, r)
+		case <-r.Context().Done():
+		}
+	})
+}
+
 func loopbackListener(t *testing.T) net.Listener {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
