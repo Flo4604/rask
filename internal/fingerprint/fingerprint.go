@@ -195,33 +195,49 @@ func packageMap(packages []gotool.Package) map[string]gotool.Package {
 
 // hashSalt front-loads global inputs so every suite shares one invalidation root.
 func hashSalt(ctx context.Context, tool gotool.Tool, module gotool.Module) (string, error) {
-	environment, err := tool.Environment(ctx, module.Dir)
+	salt, err := hashSaltTraced(ctx, tool, module)
 	if err != nil {
 		return "", err
+	}
+	return salt.Digest, nil
+}
+
+// hashSaltTraced records which files fed the salt while producing its digest.
+//
+// The hash stream is the compatibility contract: tracing must never change the
+// bytes written, or every existing cache key silently invalidates.
+func hashSaltTraced(ctx context.Context, tool gotool.Tool, module gotool.Module) (SaltTrace, error) {
+	environment, err := tool.Environment(ctx, module.Dir)
+	if err != nil {
+		return SaltTrace{}, err
 	}
 	roots, err := discover.LocalModuleRootsFromEnvironment(ctx, tool, module, environment)
 	if err != nil {
-		return "", err
+		return SaltTrace{}, err
 	}
+	trace := SaltTrace{GoWork: discover.GoWorkPath(environment)}
 	digest := sha256.New()
 	writeHashString(digest, formatVersion)
 	writeHashBytes(digest, gotool.SaltEnvironment(environment))
-	if goWork := discover.GoWorkPath(environment); goWork != "" {
+	if trace.GoWork != "" {
 		writeHashString(digest, "go.work")
-		if err := hashRequiredFile(digest, goWork); err != nil {
-			return "", err
+		if err := hashRequiredFile(digest, trace.GoWork); err != nil {
+			return SaltTrace{}, err
 		}
 	}
 	for _, root := range roots {
 		writeHashString(digest, root)
 		if err := hashRequiredFile(digest, filepath.Join(root, "go.mod")); err != nil {
-			return "", err
+			return SaltTrace{}, err
 		}
-		if err := hashOptionalFile(digest, filepath.Join(root, "go.sum")); err != nil {
-			return "", err
+		hashedSum, err := hashOptionalFile(digest, filepath.Join(root, "go.sum"))
+		if err != nil {
+			return SaltTrace{}, err
 		}
+		trace.Roots = append(trace.Roots, SaltRoot{Dir: root, GoSum: hashedSum})
 	}
-	return finishDigest(digest), nil
+	trace.Digest = finishDigest(digest)
+	return trace, nil
 }
 
 // hashRequiredFile adds a required metadata file to digest.
@@ -236,11 +252,11 @@ func hashRequiredFile(digest hash.Hash, path string) error {
 
 // hashOptionalFile adds an optional module file to digest when it exists.
 // Stat follows symlinks so a dangling link is skipped exactly like a missing file.
-func hashOptionalFile(digest hash.Hash, path string) error {
+func hashOptionalFile(digest hash.Hash, path string) (bool, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return nil
+		return false, nil
 	}
-	return hashRequiredFile(digest, path)
+	return true, hashRequiredFile(digest, path)
 }
 
 // hashBuild hashes one package's non-test build inputs and build dependencies.
@@ -325,14 +341,23 @@ func sortedFileUnion(p gotool.Package, groups ...[]string) []string {
 
 // hashTestdata folds runtime fixtures into the suite digest when present.
 func hashTestdata(digest hash.Hash, packageDir string) error {
-	names, err := testdataFiles(filepath.Join(packageDir, "testdata"))
+	names, err := suiteTestdataFiles(packageDir)
 	if err != nil {
 		return err
+	}
+	return hashNamedFiles(digest, packageDir, names)
+}
+
+// suiteTestdataFiles returns hashed fixture paths relative to the package dir.
+func suiteTestdataFiles(packageDir string) ([]string, error) {
+	names, err := testdataFiles(filepath.Join(packageDir, "testdata"))
+	if err != nil {
+		return nil, err
 	}
 	for index := range names {
 		names[index] = "testdata/" + names[index]
 	}
-	return hashNamedFiles(digest, packageDir, names)
+	return names, nil
 }
 
 // testdataFiles returns sorted regular fixture paths under root, bounded per package.

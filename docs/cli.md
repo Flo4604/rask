@@ -29,6 +29,21 @@ Options:
 
 rask always runs whole suites, always fails fast, and always randomizes order. Suites are scheduled in a randomized dependency-respecting order, and each stale suite runs `go test` with `-shuffle=on`. `--concurrency` controls how many suites are in flight at once — each in-flight suite is one bounded worker doing its cache check and, when stale, one suite-level `go test` process; it does not change intra-suite Go test behavior. When `--concurrency` is unset or `0`, rask uses `min(32, max(1, GOMAXPROCS-1))`. Explicit values must be between `1` and `32`. Failed suite output includes Go's `-test.shuffle <seed>` line when Go emits one, so a shuffled failure can be replayed directly with `go test -shuffle=<seed> <pkg>`. Filtered or customized runs such as `-run`, benchmarks, fuzzing, and coverage belong to plain `go test`. Unknown test flags are rejected with that hint.
 
+## `rask why`
+
+```text
+rask why <pattern> [patterns...]
+```
+
+```sh
+rask why ./internal/cache
+rask why ./...
+```
+
+`why` answers "why did this suite rerun instead of hitting the cache?" by tracing every input behind each selected suite's cache key. For each matched package it prints the full cache key, the cache verdict (`cached` with the stored counts and age, or `stale`), the module metadata behind the shared salt (`go env`, `go.work`, each local module root's `go.mod` and `go.sum`), the suite's hashed test files and `testdata` fixtures, the package's own build inputs with their build digest, and the transitive in-closure dependency graph as a tree with one abbreviated build digest per package. Test-only imports are listed separately, matching how fingerprinting hashes them. Packages already expanded earlier in a suite block render as `shown above` instead of repeating their subtree. See [Output](output.md#why-reports) for a sample report.
+
+Digests come from the same hashing code path as `rask test`, so a traced cache key always equals the key a test run would compute. To find which dependency invalidated a suite, run `rask why` before and after the unexpected rerun and compare which build digest moved. Selected packages without test files are reported as having nothing to run or cache. At least one package pattern is required, and patterns must stay inside the current module.
+
 ## `rask clean`
 
 ```text

@@ -40,6 +40,12 @@ $EDITOR pkg/foo/foo.go && rask
 Only suites whose source or local dependency closure changed rerun.
 
 ```sh
+rask why ./pkg/foo
+```
+
+Traces every input behind a suite's cache key — cached or stale, hashed files, and the dependency graph with per-package digests — so an unexpected rerun is explainable.
+
+```sh
 rask -v
 ```
 

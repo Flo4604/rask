@@ -63,6 +63,7 @@ The command creates one run-scoped child context after planning. Fail-fast and C
 | `main.go` | Executable entrypoint that assembles the root CLI command. |
 | `cmd/test` | Root test action, linear orchestration, bounded suite workers, cache policy, exit codes. |
 | `cmd/clean` | Cache-cleaning command. |
+| `cmd/why` | Cache-key tracing command; adapts fingerprint traces into rendered dependency graphs. |
 | `internal/cli` | Trimmed command parser, boolean flags, generated help. |
 | `internal/config` | Process-edge config loader for `RASK_CONFIG`, `RASK_CACHE_DIR`, remote-cache env overlays, and `~/.rask.json`. |
 | `internal/setup` | Process-bound command dependencies, signal context, frontend setup. |

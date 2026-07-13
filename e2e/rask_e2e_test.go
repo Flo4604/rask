@@ -110,6 +110,26 @@ func TestCleanCommand(t *testing.T) {
 	assertForeignCacheRefused(t, module)
 }
 
+func TestWhyCommand(t *testing.T) {
+	module := scaffoldModule(t, demoPackages(false)...)
+	cacheDir := t.TempDir()
+	cold := runRask(t, module.dir, cacheEnv(cacheDir), "why", "./dependent")
+	assertCode(t, cold, 0)
+	assertContains(t, cold.stdout, "Suite "+module.path+"/dependent")
+	assertContains(t, cold.stdout, "stale")
+	assertContains(t, cold.stdout, "└─ dep ")
+	assertContains(t, cold.stdout, "go.mod")
+	assertNotContains(t, cold.stdout, "Suite "+module.path+"/bystander")
+	assertCode(t, runRask(t, module.dir, cacheEnv(cacheDir), "./..."), 0)
+	warm := runRask(t, module.dir, cacheEnv(cacheDir), "why", "./dependent")
+	assertCode(t, warm, 0)
+	assertContains(t, warm.stdout, "cached")
+	assertNotContains(t, warm.stdout, "stale")
+	missing := runRask(t, module.dir, cacheEnv(cacheDir), "why")
+	assertCode(t, missing, 1)
+	assertContains(t, missing.stderr, "why needs a package pattern")
+}
+
 func TestTiered(t *testing.T) {
 	module := scaffoldModule(t, demoPackages(false)...)
 	remoteEnv, stop := startFakeS3(t)

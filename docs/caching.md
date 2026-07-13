@@ -36,6 +36,8 @@ The salt includes:
 
 The discovered local graph includes the main module, active `go.work` modules, and local filesystem `replace` targets. Editing a local dependency invalidates that package and selected suites that depend on it. External test import cycles stay finite because test imports are not graph edges; they are added only while hashing suite sinks.
 
+`rask why <pattern>` prints these inputs for each selected suite — the cache key and its current cached-or-stale status, the salt files, the hashed test and build files, and the transitive dependency graph with per-package build digests — so an unexpected rerun can be traced to the digest that moved. See the [CLI reference](cli.md#rask-why).
+
 ## Cache policy
 
 Only passing suites are stored. Failing suites delete the entry for their digest. Tests run with `-count=1`, so rask owns cache hits instead of layering on top of the Go test cache.

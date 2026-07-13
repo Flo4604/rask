@@ -69,6 +69,37 @@ error: test failed in pkg/mathx
 
 Package-level failures, including compile errors and stall watchdog failures, print package diagnostics when there is no individual failed test. The runner keeps up to 4096 diagnostic lines per test and per package. If more output arrives, rask reports how many lines it dropped.
 
+## Why reports
+
+`rask why <pattern>` renders one block per selected suite. The verdict comes first, then each digest input as its own section. Digests and section annotations share one right-aligned column per block, so two runs can be compared by scanning a single vertical edge for the digest that moved.
+
+```text
+Suite github.com/chronark/rask/internal/run
+
+  status     cached — 14 passed, stored 4h ago
+  cache key  59f42d1a1d5ee600040d1ea0c26ad0c3617adb9ed1e333779bd00a8c1b6ece1a
+
+  module inputs            hashed into every suite's cache key
+    go env
+    /Users/you/rask/go.mod
+
+  test files               hashed into this suite only
+    run_test.go
+    run_unix_test.go
+
+  package files            build digest a8311104b3ac
+    run.go
+
+  dependencies             build digests of transitive imports
+    ├─ internal/assert     9532fd24df60
+    └─ internal/gotool     ecfed894ec5c
+       └─ internal/assert  shown above
+
+Traced 2 suites: 1 cached, 1 without tests
+```
+
+In-module dependency rows shorten import paths the same way test output does. A package already expanded earlier in the block renders once with `shown above` instead of repeating its subtree. Test-only imports get their own tree section. Tracing more than one suite appends the `Traced` summary; selected packages without test files render as one `no test files` line.
+
 ## Progress region
 
 On a terminal, rask paints a sticky progress region at the bottom. Finished suite blocks stream above it. On a non-terminal, such as CI or a pipe, progress events do not print.

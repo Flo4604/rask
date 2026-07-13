@@ -8,6 +8,7 @@ import (
 
 	"github.com/chronark/rask/cmd/clean"
 	testcmd "github.com/chronark/rask/cmd/test"
+	"github.com/chronark/rask/cmd/why"
 	"github.com/chronark/rask/internal/cli"
 	"github.com/chronark/rask/internal/setup"
 )
@@ -34,6 +35,7 @@ func main() {
 		UnknownFlagHint:    "rask supports only -v/--verbose, --no-cache, --concurrency, and --version; use `go test` for other flags",
 		Commands: []*cli.Command{
 			clean.Command(),
+			why.Command(),
 		},
 	}
 	os.Exit(setup.Execute(app, os.Args))
