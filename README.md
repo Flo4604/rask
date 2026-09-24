@@ -1,3 +1,6 @@
+<img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/1b34b6ef-b0a4-42f7-a009-6637e1d4453c" />
+
+
 # rask
 
 rask is a Go test runner that reuses passing results, on your machine or across machines through an S3-compatible cache. It skips unchanged packages that already passed, runs the rest in parallel, and stops on the first failure. Use your existing Go tests. No test rewrites required.
