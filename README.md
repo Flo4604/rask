@@ -88,7 +88,7 @@ part of setup as incomplete rather than silently falling back to local-only.
 
 Supported platforms: macOS and Linux, on amd64 and arm64. Go must be on `PATH` to run tests.
 
-With Go 1.26 or newer:
+With Go 1.27.1 or newer:
 
 ```bash
 go install github.com/chronark/rask@latest

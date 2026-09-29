@@ -386,7 +386,7 @@ func serveFakeS3List(
 // every docker command that received it.
 func dockerRunMinio(t *testing.T) string {
 	t.Helper()
-	image := "minio/minio:RELEASE.2024-01-16T16-07-38Z"
+	image := "ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z"
 	command := exec.Command("docker", "run", "-d", "--rm", "-p", "127.0.0.1:0:9000",
 		"-e", "MINIO_ROOT_USER=rask-access", "-e", "MINIO_ROOT_PASSWORD=rask-secret",
 		image, "server", "/data")
